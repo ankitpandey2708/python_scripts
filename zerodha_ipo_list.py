@@ -73,20 +73,19 @@ def scrape_data(url, xpath):
         df.to_csv(csv_file_path, index=False)
         print("Data converted to CSV successfully.")
 
-        # Send email with attachment
         print("Sending email...")
         from_email = ""
         password = "" #https://myaccount.google.com/apppasswords
-        to_email = ""
-        cc = ""
+        to  = ['']
+        cc  = ['']
         subject = "Daily IPO Data"
         body = ""
         
         msg = MIMEMultipart()
         msg['From'] = from_email
-        msg['To'] = to_email
+        msg['To'] = ', '.join(to)
         msg['Subject'] = subject
-        msg['Cc'] = cc
+        msg['Cc'] = ', '.join(cc)
         msg.attach(MIMEText(body, 'plain'))
 
         with open(csv_file_path, "rb") as attachment:
@@ -99,7 +98,7 @@ def scrape_data(url, xpath):
         server = smtplib.SMTP('smtp.gmail.com', 587)
         server.starttls()
         server.login(from_email, password)
-        server.sendmail(from_email, to_email, msg.as_string())
+        server.sendmail(from_email, to+cc, msg.as_string())
         server.quit()
         print("Email sent successfully.")
         
