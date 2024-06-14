@@ -22,6 +22,7 @@ def scrape_data(url, xpath):
     
 
     data = table[0]
+    # print(etree.tostring(data).decode("utf-8"))
     rows = data.findall('.//tr')
     
     
