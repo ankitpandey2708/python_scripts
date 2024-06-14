@@ -27,6 +27,35 @@ def scrape_data(url, xpath):
     
     values = []
 
+    # for row in rows:
+    #     columns = []
+    #     for td in row.findall('.//td'):
+    #         text = ''.join(td.xpath('text()')).strip()
+    #         a = td.find('.//a')
+    #         if a is not None and a.text and text == "":
+    #             text = a.text.strip()
+           
+    #         columns.append(text)
+    #     columns = [columns[i] for i in range(len(columns)) if i not in [7,8]]
+    #     values.append(columns)
+    
+    # ipo_data = []
+    # keys = ["Name", "Open_Date", "Close_Date","Listing_Date","Issue_Price","Issue_Size(in cr)","Lot_Size"]
+
+    # for value in values:
+    #     entry = dict(zip(keys, value))
+    #     ipo_data.append(entry)
+    # print("Data fetched.")
+    
+    # filtered_data = []
+
+    # for ipo in ipo_data:
+    #     ipo_close_date =   datetime.strptime(ipo['Close_Date'], '%b %d, %Y').date()
+    #     if ipo_close_date >= datetime.now().date():
+    #         filtered_data.append(ipo)
+    # print("Data filtered.")
+
+
     for row in rows:
         fourth_td = row.findall('.//td')[3]
         if fourth_td.text.strip() != "–" :
@@ -73,11 +102,12 @@ def scrape_data(url, xpath):
         df.to_csv(csv_file_path, index=False)
         print("Data converted to CSV successfully.")
 
+        # Send email with attachment
         print("Sending email...")
-        from_email = ""
-        password = "" #https://myaccount.google.com/apppasswords
-        to  = ['']
-        cc  = ['']
+        from_email = "ankitpandey2708@gmail.com"
+        password = "uvul mqfu nhil maym" #https://myaccount.google.com/apppasswords
+        to  = ['ankitpandey2708@gmail.com']
+        cc  = ['ankit.pandey@plumhq.com']
         subject = "Daily IPO Data"
         body = ""
         
@@ -106,7 +136,10 @@ def scrape_data(url, xpath):
 # URL and XPath expression
 url = "https://zerodha.com/ipo/"
 xpath = "/html/body/main/div/section[1]/div[2]/div[1]/table/tbody"
-#xpath = "/html/body/main/div/section[1]/div[2]/div[3]/table/tbody"
+
+# url = "https://www.chittorgarh.com/report/mainboard-ipo-list-in-india-bse-nse/83/"
+# xpath = "/html/body/div[10]/div[3]/div[1]/div[5]/div/div[2]/div/table/tbody"
+
 
 # Call the function to scrape data
 scrape_data(url, xpath)
