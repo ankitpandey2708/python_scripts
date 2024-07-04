@@ -51,8 +51,8 @@ def scrape_data(url, xpath):
     # filtered_data = []
 
     # for ipo in ipo_data:
-    #     ipo_close_date =   datetime.strptime(ipo['Close_Date'], '%b %d, %Y').date()
-    #     if ipo_close_date >= datetime.now().date():
+    #     ipo_close_date =   datetime.strptime(ipo['Close_Date'], '%b %d, %Y').date() if ipo['Close_Date'] else None
+    #     if ipo_close_date and ipo_close_date >= datetime.now().date():
     #         filtered_data.append(ipo)
     # print("Data filtered.")
 
