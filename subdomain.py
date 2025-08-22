@@ -15,7 +15,7 @@ def fetch_crtsh(domain):
     url = f"https://crt.sh/?q=%25.{domain}&output=json"
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=headers, timeout=20)
+        r = requests.get(url, headers=headers, timeout=40)
         if r.status_code != 200:
             return set()
         data = r.json()
@@ -169,3 +169,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
