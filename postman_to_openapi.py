@@ -2,11 +2,11 @@
 Get API_KEY from https://web.postman.co/settings/me/api-keys
 
 
-python p2o.py --collection COLLECTION_ID --api-key API_KEY --out openapi.json
+python postman_to_openapi.py --collection COLLECTION_ID --api-key API_KEY --out openapi.json
 
 OR
 
-python p2o.py --collection COLLECTION_ID --api-key API_KEY --out openapi.yaml
+python postman_to_openapi.py --collection COLLECTION_ID --api-key API_KEY --out openapi.yaml
 """
 import argparse
 import os
@@ -114,3 +114,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
