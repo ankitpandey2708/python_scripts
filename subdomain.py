@@ -120,10 +120,10 @@ def fetch_waybackarchive(domain):
         for row in data[1:]:
             original = row[0]
             try:
-                parsed = urlparse(original)
-                host = parsed.hostname
+                # Robust extraction: handle protocols, paths, and ports
+                host = original.split('://')[-1].split('/')[0].split(':')[0].lower()
                 if host and host.endswith(domain) and not host.startswith('*'):
-                    hosts.add(host.lower())
+                    hosts.add(host)
             except Exception:
                 continue
         return hosts
@@ -145,9 +145,10 @@ def fetch_commoncrawl(domain):
                 try:
                     obj = requests.utils.json.loads(line.strip())
                     if obj and "url" in obj:
-                        host = urlparse(obj["url"]).hostname
+                        # Robust extraction: handle protocols, paths, and ports
+                        host = obj["url"].split('://')[-1].split('/')[0].split(':')[0].lower()
                         if host and host.endswith(domain) and not host.startswith('*'):
-                            found.add(host.lower())
+                            found.add(host)
                 except Exception:
                     continue
             if found:
