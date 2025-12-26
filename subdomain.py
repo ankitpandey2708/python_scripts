@@ -23,7 +23,7 @@ HEADERS = {
 def fetch_crtsh(domain):
     url = f"https://crt.sh/?q=%25.{domain}&output=json"
     try:
-        r = requests.get(url, headers=HEADERS, timeout=40)
+        r = requests.get(url, headers=HEADERS, timeout=60)
         if r.status_code != 200:
             return set()
         data = r.json()
@@ -229,7 +229,6 @@ def check_subdomain_status(subdomain):
 def main():
     parser = argparse.ArgumentParser(description="Subdomain enumerator and checker")
     parser.add_argument("domain", help="Domain to enumerate")
-    parser.add_argument("--threads", type=int, default=10, help="Number of threads for checks")
     args = parser.parse_args()
 
     domain = args.domain.lower().strip()
@@ -289,7 +288,7 @@ def main():
     csv_filename = f"{domain}_subdomains.csv"
     results = []
 
-    with ThreadPoolExecutor(max_workers=args.threads) as executor:
+    with ThreadPoolExecutor() as executor:
         future_to_sub = {executor.submit(check_subdomain_status, sub): sub for sub in sorted(all_subdomains)}
         for future in tqdm(as_completed(future_to_sub), total=len(all_subdomains), desc="Checking"):
             sub = future_to_sub[future]
