@@ -1,16 +1,3 @@
-"""
-Batch rename property PDF files based on Block letter and Flat number.
-Extracts "BLOCK X" and "Flat No NNN" from PDF content, renames to X_NNN.pdf (e.g., A206.pdf)
-
-Usage:
-    1. pip install pdfplumber
-    2. Update FOLDER_PATH below to your Downloads folder
-    3. Run: python rename_property_pdfs.py
-    
-    It does a DRY RUN first (shows what would be renamed). 
-    Set DRY_RUN = False to actually rename.
-"""
-
 import os
 import re
 import pdfplumber
@@ -101,7 +88,7 @@ def main():
 
         if block and flat_no:
             base_name = os.path.splitext(filename)[0]
-            new_name = f"{base_name}_{block}{flat_no}.pdf"
+            new_name = f"{block}{flat_no}_{base_name}.pdf"
             new_path = os.path.join(FOLDER_PATH, new_name)
 
             # Handle duplicates
