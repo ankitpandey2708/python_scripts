@@ -99,13 +99,6 @@ def find_nmap():
     ])
 
 
-def find_wireshark():
-    return find_tool("wireshark", [
-        r"C:\Program Files\Wireshark\Wireshark.exe",
-        r"/Applications/Wireshark.app/Contents/MacOS/Wireshark",
-    ])
-
-
 def find_tshark():
     return find_tool("tshark", [
         r"C:\Program Files\Wireshark\tshark.exe",
@@ -303,18 +296,7 @@ payloads are encrypted - you see WHICH hosts, not the contents.
 """)
     print("  a) 15s DNS capture       (domains being looked up)")
     print("  b) 15s connections       (which servers this PC connects to - TLS SNI)")
-    print("  c) Launch Wireshark GUI")
-    sub = input("Choose a/b/c [a]: ").strip().lower() or "a"
-
-    if sub == "c":
-        ws = find_wireshark()
-        if ws:
-            print("Launching Wireshark - pick your Wi-Fi adapter and double-click it.")
-            print("Useful filters:  dns  |  http  |  tls.handshake.type==1  |  ip.addr == <ip>")
-            subprocess.Popen([ws])
-        else:
-            print("Wireshark not found. Install: winget install WiresharkFoundation.Wireshark")
-        return
+    sub = input("Choose a/b [a]: ").strip().lower() or "a"
 
     tshark = find_tshark()
     if not tshark:
@@ -932,7 +914,7 @@ def _save_json(path, data):
 MENU = """
   1) Discover devices on the network
   2) Port scan a device (nmap, or built-in fallback)
-  3) Read traffic (Wireshark)
+  3) Read traffic (DNS / connections, via tshark)
   4) Remote access helpers
   5) Intercept a device's traffic   (auto IPv4/IPv6, your own devices only)
   q) Quit
