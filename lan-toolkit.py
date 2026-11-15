@@ -29,6 +29,7 @@ import time
 # toolkit works without it.  Install with:  pip install scapy
 
 IS_WIN = platform.system() == "Windows"
+IS_MAC = platform.system() == "Darwin"
 HOME = os.path.expanduser("~")
 
 
@@ -53,6 +54,13 @@ def default_gateway(prefix):
         if IS_WIN:
             out = subprocess.run(["ipconfig"], capture_output=True, text=True).stdout
             m = re.search(r"Default Gateway[ .]*: ?([\d.]+)", out)
+            if m:
+                return m.group(1)
+        elif IS_MAC:
+            # macOS has no `ip`; use the route table
+            out = subprocess.run(["route", "-n", "get", "default"],
+                                 capture_output=True, text=True).stdout
+            m = re.search(r"gateway:\s*([\d.]+)", out)
             if m:
                 return m.group(1)
         else:
@@ -85,6 +93,9 @@ def find_nmap():
     return find_tool("nmap", [
         r"C:\Program Files (x86)\Nmap\nmap.exe",
         r"C:\Program Files\Nmap\nmap.exe",
+        "/opt/homebrew/bin/nmap",   # macOS Apple Silicon (Homebrew)
+        "/usr/local/bin/nmap",      # macOS Intel (Homebrew)
+        "/usr/bin/nmap",            # Linux
     ])
 
 
@@ -118,9 +129,11 @@ def wifi_interface(tshark):
 # ----------------------------------------------------------------------
 def ping(host):
     if IS_WIN:
-        cmd = ["ping", "-n", "1", "-w", "300", host]
+        cmd = ["ping", "-n", "1", "-w", "300", host]          # -w = ms
+    elif IS_MAC:
+        cmd = ["ping", "-c", "1", "-t", "1", host]            # macOS: -t = seconds
     else:
-        cmd = ["ping", "-c", "1", "-W", "1", host]
+        cmd = ["ping", "-c", "1", "-W", "1", host]            # Linux: -W = seconds
     return subprocess.run(cmd, capture_output=True).returncode == 0
 
 
@@ -252,15 +265,22 @@ def builtin_scan(ip):
 
 
 def step_portscan(net):
-    target = input(f"Target IP [blank = scan whole {net['prefix']}0/24]: ").strip()
+    choice = input(f"Target IP, 'all' for whole subnet, or blank to pick from a list: ").strip()
+    if choice.lower() == "all":
+        target = f"{net['prefix']}0/24"
+    elif choice:
+        target = choice
+    else:
+        target = _pick_device(net, ipv6=False)
+        if not target:
+            return
     nmap = find_nmap()
     if nmap:
-        tgt = target or f"{net['prefix']}0/24"
-        print(f"\n[Step 2] nmap service scan of {tgt} (top 100 ports)...")
-        subprocess.run([nmap, "-sV", "-T4", "--top-ports", "100", tgt])
+        print(f"\n[Step 2] nmap service scan of {target} (top 100 ports)...")
+        subprocess.run([nmap, "-sV", "-T4", "--top-ports", "100", target])
     else:
         print("nmap not found - using built-in scanner (single host only).")
-        builtin_scan(target or net["gateway"])
+        builtin_scan(target)
 
 
 # ----------------------------------------------------------------------
@@ -765,24 +785,21 @@ through this PC. Only on your own network/devices. Restored on exit.""")
 # ----------------------------------------------------------------------
 def step_intercept(net, target=None):
     if target is None:
-        print("\nDiscovering devices to choose a target ...")
-        cands = []
-        for ip, mac, name, priv, note in discover_devices(net):
-            if mac != "(this pc)" and ip != net["gateway"]:
-                cands.append((ip, mac, name, "IPv4"))
-        for ip6, mac in _ipv6_neighbors():
-            cands.append((ip6, mac, "(IPv6 neighbor)", "IPv6"))
-        if not cands:
-            print("  No candidate devices found."); return
-        print("\nSelect a device to intercept (YOUR OWN devices only):")
-        for idx, (ip, mac, name, fam) in enumerate(cands, 1):
-            print(f"  {idx}) [{fam}] {ip:<34} {mac:<18} {name}")
-        choice = input("Number (blank to cancel): ").strip()
-        if not choice.isdigit() or not (1 <= int(choice) <= len(cands)):
-            print("  Cancelled."); return
-        target = cands[int(choice) - 1][0]
+        target = _pick_device(net, ipv6=True)
+        if not target:
+            return
 
-    # Dispatch by address family: ':' => IPv6 (NDP), else IPv4 (ARP)
+    # Raw packet injection needs admin. If we're not elevated, relaunch THIS
+    # intercept in an elevated window (one UAC click) instead of just failing.
+    if IS_WIN and not _is_admin():
+        flag = "--ndp" if ":" in target else "--arp"
+        print(f"\nThis needs admin for raw packet access.")
+        print("Accept the UAC prompt - it will run in an elevated window and")
+        print("save results to Downloads (arp-sni.txt / ndp-sni.txt).")
+        _relaunch_elevated([flag, target])
+        return
+
+    # Already elevated (or non-Windows): dispatch by address family.
     if ":" in target:
         step_ndp(net, target)
     else:
@@ -943,40 +960,103 @@ def run_menu(net):
         "4": step_remote, "5": step_intercept,
     }
     while True:
-        print(MENU)
-        choice = input("Choose: ").strip().lower()
-        if choice == "q":
-            break
-        action = actions.get(choice)
-        if action:
-            try:
-                action(net)
-            except Exception as e:
-                print(f"Error: {e}")
-        else:
-            print("Pick 1-5 or q.")
+        try:
+            print(MENU)
+            choice = input("Choose: ").strip().lower()
+            if choice == "q":
+                break
+            action = actions.get(choice)
+            if action:
+                try:
+                    action(net)
+                except Exception as e:
+                    print(f"Error: {e}")
+                input("\n[Enter] to return to the menu ...")   # keep results on screen
+            else:
+                print("Pick 1-5 or q.")
+        except KeyboardInterrupt:
+            print("\nInterrupted - back to menu. (q to quit)")
 
 
-def _pick_target(net):
-    """Show discovered devices and let the user choose one to intercept."""
-    print("\nDiscovering devices to choose a target ...")
-    rows = discover_devices(net)
-    cands = [(ip, mac, name) for ip, mac, name, priv, note in rows
-             if mac != "(this pc)" and ip != net["gateway"]]
+def _pick_device(net, ipv6=True):
+    """Discover devices and let the user choose one. Returns an IP or None.
+    Shared by port scan (IPv4 only) and intercept (IPv4 + IPv6)."""
+    print("\nDiscovering devices ...")
+    cands = []
+    for ip, mac, name, priv, note in discover_devices(net):
+        if mac != "(this pc)" and ip != net["gateway"]:
+            cands.append((ip, mac, name, "IPv4"))
+    if ipv6:
+        for ip6, mac in _ipv6_neighbors():
+            cands.append((ip6, mac, "(IPv6 neighbor)", "IPv6"))
     if not cands:
         print("  No candidate devices found."); return None
-    print("\nSelect a device to intercept (YOUR OWN devices only):")
-    for idx, (ip, mac, name) in enumerate(cands, 1):
-        print(f"  {idx}) {ip:<15} {mac:<18} {name}")
+    print("\nSelect a device (YOUR OWN devices only):")
+    for idx, (ip, mac, name, fam) in enumerate(cands, 1):
+        tag = f"[{fam}] " if ipv6 else ""
+        print(f"  {idx}) {tag}{ip:<34} {mac:<18} {name}")
     choice = input("Number (blank to cancel): ").strip()
     if not choice.isdigit() or not (1 <= int(choice) <= len(cands)):
         print("  Cancelled."); return None
     return cands[int(choice) - 1][0]
 
 
+def _is_admin():
+    try:
+        if IS_WIN:
+            import ctypes
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0
+        return os.geteuid() == 0
+    except Exception:
+        return False
+
+
+def _relaunch_elevated(extra_args):
+    """Re-run THIS script elevated (Windows UAC) with the given args. Returns
+    True if the elevation was launched."""
+    if not IS_WIN:
+        print("  Run again with sudo for raw packet access."); return False
+    try:
+        import ctypes
+        params = f'"{os.path.abspath(__file__)}" ' + " ".join(extra_args)
+        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+        return True
+    except Exception as e:
+        print(f"  Could not elevate: {e}"); return False
+
+
+HELP = """lan-toolkit.py - home network tinkering toolkit (your own network only)
+
+USAGE
+  python lan-toolkit.py [mode]
+
+MODES
+  (no args)        Auto report: discover + scan + traffic + remote + baseline, then exit
+  --menu, -m       Interactive menu (pick steps 1-5 one at a time)
+  --arp  [ip]      Intercept an IPv4 device (ARP). No ip = pick from a list. Needs admin.
+  --ndp  [ipv6]    Intercept an IPv6 device (NDP). No addr = pick from a list. Needs admin.
+  --help, -h       Show this help
+
+NOTES
+  * Interception is for devices on a network YOU OWN. Don't use it elsewhere.
+  * Outputs are written to your Downloads folder (lan-report / arp-sni / ndp-sni /
+    lan-known-devices).
+  * The intercept auto-elevates (one UAC prompt) when run without admin.
+"""
+
+
+def print_help():
+    print(HELP)
+
+
 def main():
-    net = get_net()
     args = [a.lower() for a in sys.argv[1:]]
+
+    if "--help" in args or "-h" in args:
+        print_help()
+        return
+
+    net = get_net()
 
     # --arp [ip] : run the ARP intercept. With an IP it runs non-interactively;
     # without one, it lists devices and lets you pick. (Needs an admin shell.)
@@ -985,7 +1065,7 @@ def main():
         nxt = args[i + 1] if i + 1 < len(args) else None
         target = nxt if (nxt and re.match(r"^\d{1,3}(\.\d{1,3}){3}$", nxt)) else None
         if target is None:
-            target = _pick_target(net)
+            target = _pick_device(net, ipv6=False)
         if target:
             step_arp(net, target)
         return
