@@ -461,6 +461,26 @@ def ip_org(ip):
     return "  |  ".join(parts) if parts else "?"
 
 
+def _flows_to_seen(cap, target):
+    """tshark lines 'dst<TAB>sni' -> [(sni, dst), ...], one per destination IP,
+    keeping any SNI seen for that IP (so already-open flows appear with no SNI).
+    Some packets carry multiple ip.dst values (comma-joined, e.g. the target's
+    own IP in an embedded header) - pick the external one and drop the target."""
+    flows = {}   # dst -> best sni ("" if none seen)
+    for line in cap.splitlines():
+        parts = line.split("\t")
+        if not parts or not parts[0].strip():
+            continue
+        dsts = [d.strip() for d in parts[0].split(",") if d.strip()]
+        dst = next((d for d in dsts if d != target), "")
+        if not dst:
+            continue
+        sni = parts[1].strip() if len(parts) > 1 else ""
+        if dst not in flows or (sni and not flows[dst]):
+            flows[dst] = sni
+    return [(sni, dst) for dst, sni in flows.items()]
+
+
 def _report_capture(seen, target, fname):
     """seen: list of (sni, dst). Print each; when SNI is empty (ECH/relay),
     fall back to ip_org(dst). Also save to Downloads/<fname>."""
@@ -559,20 +579,17 @@ and your own devices. Everything is restored when it stops.""")
             return
         print(f"  {'SERVER (SNI)':<40}DEST IP")
         print("  " + "-" * 56)
+        # Capture ALL 443 traffic from the target (not just handshakes), so
+        # ALREADY-OPEN connections show up too - their data packets still
+        # reveal the destination IP, which we resolve via ip_org().
         cap = subprocess.run(
             [tshark, "-i", iface, "-a", "duration:20", "-n",
-             "-Y", f"tls.handshake.type==1 && ip.src=={target}",
-             "-T", "fields", "-e", "tls.handshake.extensions_server_name",
-             "-e", "ip.dst"],
+             "-Y", f"ip.src=={target} && (tcp.port==443 || udp.port==443)",
+             "-T", "fields", "-e", "ip.dst",
+             "-e", "tls.handshake.extensions_server_name"],
             capture_output=True, text=True).stdout
-        seen = []
-        for line in cap.splitlines():
-            parts = line.split("\t")
-            if len(parts) == 2 and parts[1]:        # need a dst; SNI may be empty (ECH)
-                pair = (parts[0], parts[1])
-                if pair not in seen:
-                    seen.append(pair)
-        _report_capture(seen, target, "arp-sni.txt")   # falls back to IP->org when no SNI
+        seen = _flows_to_seen(cap, target)
+        _report_capture(seen, target, "arp-sni.txt")   # name if handshake seen, else IP->org
     finally:
         print("\nStopping spoof and RESTORING the network ...")
         stop.set()
@@ -692,17 +709,12 @@ through this PC. Only on your own network/devices. Restored on exit.""")
         print("  " + "-" * 56)
         cap = subprocess.run(
             [tshark, "-i", iface, "-a", "duration:20", "-n",
-             "-Y", f"tls.handshake.type==1 && ipv6.src=={target}",
-             "-T", "fields", "-e", "tls.handshake.extensions_server_name",
-             "-e", "ipv6.dst"],
+             "-Y", f"ipv6.src=={target} && (tcp.port==443 || udp.port==443)",
+             "-T", "fields", "-e", "ipv6.dst",
+             "-e", "tls.handshake.extensions_server_name"],
             capture_output=True, text=True).stdout
-        for line in cap.splitlines():
-            parts = line.split("\t")
-            if len(parts) == 2 and parts[1]:        # need a dst; SNI may be empty (ECH)
-                pair = (parts[0], parts[1])
-                if pair not in seen:
-                    seen.append(pair)
-        _report_capture(seen, target, "ndp-sni.txt")   # falls back to IP->org when no SNI
+        seen = _flows_to_seen(cap, target)
+        _report_capture(seen, target, "ndp-sni.txt")   # name if handshake seen, else IP->org
     finally:
         print("\nStopping spoof and RESTORING the network ...")
         stop.set()
