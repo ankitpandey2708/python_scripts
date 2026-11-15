@@ -117,7 +117,7 @@ def wifi_interface(tshark):
     """Return the tshark interface number whose name looks like Wi-Fi."""
     out = subprocess.run([tshark, "-D"], capture_output=True, text=True).stdout
     for line in out.splitlines():
-        if re.search(r"wi-?fi|wlan|wireless|airport|en0", line, re.I):
+        if re.search(r"wi-?fi|wlan|wlp|wlx|wl\d|wireless|airport|en0", line, re.I):
             m = re.match(r"\s*(\d+)\.", line)
             if m:
                 return m.group(1)
@@ -148,8 +148,17 @@ def ping_sweep(prefix):
 
 
 def arp_table(prefix):
-    """Return {ip: mac} from the OS ARP cache."""
-    out = subprocess.run(["arp", "-a"], capture_output=True, text=True).stdout
+    """Return {ip: mac} from the OS ARP cache. Falls back to `ip neigh` on
+    Linux systems where net-tools `arp` is not installed."""
+    try:
+        out = subprocess.run(["arp", "-a"], capture_output=True, text=True).stdout
+    except FileNotFoundError:
+        out = ""
+    if not out.strip() and not IS_WIN:
+        try:
+            out = subprocess.run(["ip", "neigh"], capture_output=True, text=True).stdout
+        except Exception:
+            out = ""
     table = {}
     for line in out.splitlines():
         if prefix not in line:
@@ -408,46 +417,78 @@ def _fwd_alias():
 
 
 def _set_forwarding(alias, state, family="IPv4"):
-    if IS_WIN:
-        subprocess.run(["powershell", "-NoProfile", "-Command",
-                        f"Set-NetIPInterface -InterfaceAlias '{alias}' "
-                        f"-AddressFamily {family} -Forwarding {state}"],
-                       capture_output=True, text=True)
+    """Toggle IP forwarding. Windows: per-interface via PowerShell. mac/Linux:
+    global via sysctl (needs root; the intercept runs elevated)."""
+    on = "1" if state == "Enabled" else "0"
+    try:
+        if IS_WIN:
+            subprocess.run(["powershell", "-NoProfile", "-Command",
+                            f"Set-NetIPInterface -InterfaceAlias '{alias}' "
+                            f"-AddressFamily {family} -Forwarding {state}"],
+                           capture_output=True, text=True)
+        elif IS_MAC:
+            key = "net.inet.ip.forwarding" if family == "IPv4" else "net.inet6.ip6.forwarding"
+            subprocess.run(["sysctl", "-w", f"{key}={on}"], capture_output=True, text=True)
+        else:   # Linux
+            key = "net.ipv4.ip_forward" if family == "IPv4" else "net.ipv6.conf.all.forwarding"
+            subprocess.run(["sysctl", "-w", f"{key}={on}"], capture_output=True, text=True)
+    except Exception:
+        pass
 
 
 def _ipv6_gateway():
     """Link-local address of the IPv6 default router (fe80::...), or None."""
-    if not IS_WIN:
-        return None
-    ps = ("Get-NetRoute -DestinationPrefix '::/0' -ErrorAction SilentlyContinue | "
-          "Select-Object -First 1 -ExpandProperty NextHop")
     try:
-        gw = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                            capture_output=True, text=True).stdout.strip()
-        return gw or None
+        if IS_WIN:
+            ps = ("Get-NetRoute -DestinationPrefix '::/0' -ErrorAction SilentlyContinue | "
+                  "Select-Object -First 1 -ExpandProperty NextHop")
+            gw = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                                capture_output=True, text=True).stdout.strip()
+        elif IS_MAC:
+            out = subprocess.run(["route", "-n", "get", "-inet6", "default"],
+                                 capture_output=True, text=True).stdout
+            m = re.search(r"gateway:\s*([0-9a-fA-F:]+)", out)
+            gw = m.group(1) if m else ""
+        else:   # Linux
+            out = subprocess.run(["ip", "-6", "route", "show", "default"],
+                                 capture_output=True, text=True).stdout
+            m = re.search(r"default via ([0-9a-fA-F:]+)", out)
+            gw = m.group(1) if m else ""
+        return gw.split("%")[0] or None     # strip any %zone id
     except Exception:
         return None
 
 
 def _ipv6_neighbors(net_prefix_unused=None):
     """Reachable IPv6 neighbors as [(ip6, mac), ...] (excludes link-local fe80)."""
-    if not IS_WIN:
-        return []
-    ps = ("Get-NetNeighbor -AddressFamily IPv6 -ErrorAction SilentlyContinue | "
-          "Where-Object {$_.State -in 'Reachable','Stale' -and "
-          "$_.IPAddress -notlike 'fe80*' -and $_.LinkLayerAddress} | "
-          "ForEach-Object {\"$($_.IPAddress)=$($_.LinkLayerAddress)\"}")
+    res = []
     try:
-        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                             capture_output=True, text=True).stdout
-        res = []
-        for line in out.splitlines():
-            if "=" in line:
-                ip6, mac = line.strip().split("=", 1)
-                res.append((ip6, mac.lower().replace("-", ":")))
-        return res
+        if IS_WIN:
+            ps = ("Get-NetNeighbor -AddressFamily IPv6 -ErrorAction SilentlyContinue | "
+                  "Where-Object {$_.State -in 'Reachable','Stale' -and "
+                  "$_.IPAddress -notlike 'fe80*' -and $_.LinkLayerAddress} | "
+                  "ForEach-Object {\"$($_.IPAddress)=$($_.LinkLayerAddress)\"}")
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                                 capture_output=True, text=True).stdout
+            for line in out.splitlines():
+                if "=" in line:
+                    ip6, mac = line.strip().split("=", 1)
+                    res.append((ip6, mac.lower().replace("-", ":")))
+        elif IS_MAC:
+            out = subprocess.run(["ndp", "-an"], capture_output=True, text=True).stdout
+            for line in out.splitlines():
+                m = re.match(r"\s*([0-9a-fA-F:]+)%?\S*\s+([0-9a-fA-F:]{17})", line)
+                if m and not m.group(1).lower().startswith("fe80"):
+                    res.append((m.group(1), m.group(2).lower()))
+        else:   # Linux
+            out = subprocess.run(["ip", "-6", "neigh"], capture_output=True, text=True).stdout
+            for line in out.splitlines():
+                m = re.search(r"^([0-9a-fA-F:]+)\s+dev\s+\S+\s+lladdr\s+([0-9a-fA-F:]{17})", line)
+                if m and not m.group(1).lower().startswith("fe80"):
+                    res.append((m.group(1), m.group(2).lower()))
     except Exception:
-        return []
+        pass
+    return res
 
 
 # ----------------------------------------------------------------------
@@ -789,13 +830,16 @@ def step_intercept(net, target=None):
         if not target:
             return
 
-    # Raw packet injection needs admin. If we're not elevated, relaunch THIS
-    # intercept in an elevated window (one UAC click) instead of just failing.
-    if IS_WIN and not _is_admin():
+    # Raw packet injection needs admin/root. If we're not elevated, relaunch
+    # THIS intercept elevated (Windows UAC / sudo) instead of just failing.
+    if not _is_admin():
         flag = "--ndp" if ":" in target else "--arp"
-        print(f"\nThis needs admin for raw packet access.")
-        print("Accept the UAC prompt - it will run in an elevated window and")
-        print("save results to Downloads (arp-sni.txt / ndp-sni.txt).")
+        print("\nThis needs admin/root for raw packet access.")
+        if IS_WIN:
+            print("Accept the UAC prompt - runs in an elevated window; results")
+            print("save to Downloads (arp-sni.txt / ndp-sni.txt).")
+        else:
+            print("Enter your password for sudo when prompted.")
         _relaunch_elevated([flag, target])
         return
 
@@ -1012,17 +1056,22 @@ def _is_admin():
 
 
 def _relaunch_elevated(extra_args):
-    """Re-run THIS script elevated (Windows UAC) with the given args. Returns
-    True if the elevation was launched."""
-    if not IS_WIN:
-        print("  Run again with sudo for raw packet access."); return False
+    """Re-run THIS script with root/admin. Windows: UAC in a new window.
+    mac/Linux: sudo in the same terminal (prompts for password, then returns).
+    Returns True if the elevated run was launched."""
+    script = os.path.abspath(__file__)
     try:
-        import ctypes
-        params = f'"{os.path.abspath(__file__)}" ' + " ".join(extra_args)
-        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+        if IS_WIN:
+            import ctypes
+            params = f'"{script}" ' + " ".join(extra_args)
+            ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+        else:
+            subprocess.run(["sudo", sys.executable, script] + extra_args)
         return True
     except Exception as e:
-        print(f"  Could not elevate: {e}"); return False
+        print(f"  Could not elevate ({e}). Run manually:")
+        print(f"    sudo {sys.executable} {script} {' '.join(extra_args)}")
+        return False
 
 
 HELP = """lan-toolkit.py - home network tinkering toolkit (your own network only)
