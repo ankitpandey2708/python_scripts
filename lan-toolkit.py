@@ -1,0 +1,544 @@
+#!/usr/bin/env python3
+"""
+lan-toolkit.py  -  Home network tinkering toolkit (cross-platform)
+------------------------------------------------------------------
+Legitimate network admin / security learning for devices and networks
+YOU OWN. Do not use against networks or devices that are not yours.
+
+Standard library only - no pip installs needed.
+Works on Windows, macOS and Linux.
+
+Run:   python lan-toolkit.py
+Some steps work best in an admin/root shell (packet capture, OS scan).
+"""
+
+import concurrent.futures as cf
+import json
+import os
+import platform
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+
+IS_WIN = platform.system() == "Windows"
+HOME = os.path.expanduser("~")
+
+
+# ----------------------------------------------------------------------
+# Network auto-detection
+# ----------------------------------------------------------------------
+def local_ip():
+    """Find this machine's LAN IP by opening a throwaway UDP socket."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))   # no packets actually sent for UDP
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def default_gateway(prefix):
+    """Best-effort gateway detection; falls back to <prefix>1."""
+    try:
+        if IS_WIN:
+            out = subprocess.run(["ipconfig"], capture_output=True, text=True).stdout
+            m = re.search(r"Default Gateway[ .]*: ?([\d.]+)", out)
+            if m:
+                return m.group(1)
+        else:
+            out = subprocess.run(["ip", "route"], capture_output=True, text=True).stdout
+            m = re.search(r"default via ([\d.]+)", out)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    return prefix + "1"
+
+
+def get_net():
+    ip = local_ip()
+    prefix = ip.rsplit(".", 1)[0] + "."
+    return {"ip": ip, "prefix": prefix, "gateway": default_gateway(prefix)}
+
+
+def find_tool(name, extra_paths):
+    p = shutil.which(name)
+    if p:
+        return p
+    for cand in extra_paths:
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
+def find_nmap():
+    return find_tool("nmap", [
+        r"C:\Program Files (x86)\Nmap\nmap.exe",
+        r"C:\Program Files\Nmap\nmap.exe",
+    ])
+
+
+def find_wireshark():
+    return find_tool("wireshark", [
+        r"C:\Program Files\Wireshark\Wireshark.exe",
+        r"/Applications/Wireshark.app/Contents/MacOS/Wireshark",
+    ])
+
+
+def find_tshark():
+    return find_tool("tshark", [
+        r"C:\Program Files\Wireshark\tshark.exe",
+        r"/Applications/Wireshark.app/Contents/MacOS/tshark",
+    ])
+
+
+def wifi_interface(tshark):
+    """Return the tshark interface number whose name looks like Wi-Fi."""
+    out = subprocess.run([tshark, "-D"], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        if re.search(r"wi-?fi|wlan|wireless|airport|en0", line, re.I):
+            m = re.match(r"\s*(\d+)\.", line)
+            if m:
+                return m.group(1)
+    return None
+
+
+# ----------------------------------------------------------------------
+# STEP 1 - Discover devices
+# ----------------------------------------------------------------------
+def ping(host):
+    if IS_WIN:
+        cmd = ["ping", "-n", "1", "-w", "300", host]
+    else:
+        cmd = ["ping", "-c", "1", "-W", "1", host]
+    return subprocess.run(cmd, capture_output=True).returncode == 0
+
+
+def ping_sweep(prefix):
+    hosts = [f"{prefix}{i}" for i in range(1, 255)]
+    alive = []
+    with cf.ThreadPoolExecutor(max_workers=64) as ex:
+        for host, ok in zip(hosts, ex.map(ping, hosts)):
+            if ok:
+                alive.append(host)
+    return alive
+
+
+def arp_table(prefix):
+    """Return {ip: mac} from the OS ARP cache."""
+    out = subprocess.run(["arp", "-a"], capture_output=True, text=True).stdout
+    table = {}
+    for line in out.splitlines():
+        if prefix not in line:
+            continue
+        ipm = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", line)
+        macm = re.search(r"([0-9a-fA-F]{2}([:-])[0-9a-fA-F]{2}(?:\2[0-9a-fA-F]{2}){4})", line)
+        if ipm and macm:
+            ip = ipm.group(1)
+            mac = macm.group(1).lower().replace("-", ":")
+            # skip broadcast / multicast entries
+            if ip.endswith(".255") or mac == "ff:ff:ff:ff:ff:ff":
+                continue
+            octet = int(ip.split(".")[0])
+            if 224 <= octet <= 239:   # multicast range
+                continue
+            table[ip] = mac
+    return table
+
+
+def hostname_for(ip):
+    try:
+        return socket.gethostbyaddr(ip)[0]
+    except (socket.herror, socket.gaierror, OSError):
+        return "-"
+
+
+def is_private_mac(mac):
+    """Randomized / locally-administered MAC: 2nd hex digit in {2,6,a,e}."""
+    try:
+        return mac[1].lower() in "26ae"
+    except IndexError:
+        return False
+
+
+def discover_devices(net):
+    """Ping-sweep + ARP + name resolution. Returns rows, no printing."""
+    ping_sweep(net["prefix"])
+    table = arp_table(net["prefix"])
+    table.setdefault(net["ip"], "(this pc)")   # ensure we list ourselves
+    rows = []
+    for ip in sorted(table, key=lambda x: int(x.split(".")[-1])):
+        mac = table[ip]
+        note = "ROUTER" if ip == net["gateway"] else ("THIS PC" if ip == net["ip"] else "")
+        priv = "yes" if is_private_mac(mac) else "no"
+        rows.append((ip, mac, hostname_for(ip), priv, note))
+    return rows
+
+
+def print_devices(rows, indent=""):
+    print(f"{indent}{'IP':<16}{'MAC':<20}{'NAME':<22}{'PRIV':<6}NOTE")
+    print(f"{indent}{'-' * 62}")
+    for ip, mac, name, priv, note in rows:
+        print(f"{indent}{ip:<16}{mac:<20}{name[:21]:<22}{priv:<6}{note}")
+
+
+def step_discover(net):
+    print(f"\n[Step 1] Discovering devices on {net['prefix']}0/24 ...")
+    print("Pinging 254 addresses...\n")
+    rows = discover_devices(net)
+    print_devices(rows)
+    return rows
+
+
+# ----------------------------------------------------------------------
+# STEP 2 - Port scan
+# ----------------------------------------------------------------------
+# Single source of truth: ports we scan for, with friendly labels.
+# Any port NOT here still gets a name via the OS services file (port_name).
+PORTS = {
+    21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns", 80: "http",
+    110: "pop3", 139: "file-share", 143: "imap", 443: "https", 445: "smb",
+    554: "rtsp/cam", 1883: "mqtt", 3389: "rdp", 5000: "upnp", 5900: "vnc",
+    8000: "dev-server", 8080: "http-alt", 8009: "chromecast", 8443: "https-alt",
+    9100: "printer", 32400: "plex",
+}
+
+
+def port_name(port):
+    """Friendly label for a port: curated map first, then the OS services file."""
+    if port in PORTS:
+        return PORTS[port]
+    try:
+        return socket.getservbyport(port)      # from /etc/services or Windows equivalent
+    except OSError:
+        return "?"
+
+
+def scan_port(ip, port, timeout=0.6):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        return port if s.connect_ex((ip, port)) == 0 else None
+
+
+def scan_common(ip):
+    """Return a sorted list of open common ports on ip."""
+    open_ports = []
+    with cf.ThreadPoolExecutor(max_workers=50) as ex:
+        futs = {ex.submit(scan_port, ip, p): p for p in PORTS}
+        for fut in cf.as_completed(futs):
+            r = fut.result()
+            if r:
+                open_ports.append(r)
+    return sorted(open_ports)
+
+
+def builtin_scan(ip):
+    print(f"\n[Step 2] Built-in scan of {ip} ({len(PORTS)} common ports)...")
+    open_ports = scan_common(ip)
+    if not open_ports:
+        print("  All scanned ports closed (typical for a phone/client device).")
+    for p in open_ports:
+        print(f"  {p:<6} open   {port_name(p)}")
+
+
+def step_portscan(net):
+    target = input(f"Target IP [blank = scan whole {net['prefix']}0/24]: ").strip()
+    nmap = find_nmap()
+    if nmap:
+        tgt = target or f"{net['prefix']}0/24"
+        print(f"\n[Step 2] nmap service scan of {tgt} (top 100 ports)...")
+        subprocess.run([nmap, "-sV", "-T4", "--top-ports", "100", tgt])
+    else:
+        print("nmap not found - using built-in scanner (single host only).")
+        builtin_scan(target or net["gateway"])
+
+
+# ----------------------------------------------------------------------
+# STEP 3 - Read traffic
+# ----------------------------------------------------------------------
+def step_traffic(net):
+    print("\n[Step 3] Reading traffic")
+    print("""You see THIS machine's unicast traffic, PLUS everyone's multicast/
+broadcast (e.g. mDNS '.local' names other devices announce). HTTPS
+payloads are encrypted - you see WHICH hosts, not the contents.
+""")
+    print("  a) 15s DNS capture       (domains being looked up)")
+    print("  b) 15s connections       (which servers this PC connects to - TLS SNI)")
+    print("  c) Launch Wireshark GUI")
+    sub = input("Choose a/b/c [a]: ").strip().lower() or "a"
+
+    if sub == "c":
+        ws = find_wireshark()
+        if ws:
+            print("Launching Wireshark - pick your Wi-Fi adapter and double-click it.")
+            print("Useful filters:  dns  |  http  |  tls.handshake.type==1  |  ip.addr == <ip>")
+            subprocess.Popen([ws])
+        else:
+            print("Wireshark not found. Install: winget install WiresharkFoundation.Wireshark")
+        return
+
+    tshark = find_tshark()
+    if not tshark:
+        print("tshark not found (comes with Wireshark). Install Wireshark first.")
+        return
+    iface = wifi_interface(tshark)
+    if not iface:
+        subprocess.run([tshark, "-D"])
+        iface = input("Enter the Wi-Fi interface number from the list above: ").strip()
+
+    if sub == "b":
+        # TLS ClientHello carries the destination server name (SNI) in clear text
+        print(f"\nCapturing HTTPS connections for 15s on interface {iface} ...")
+        print("(browse something on this PC to see more)\n")
+        print(f"{'DEST IP':<17}{'PORT':<6}SERVER")
+        print("-" * 55)
+        fields = ["-e", "ip.dst", "-e", "tcp.dstport",
+                  "-e", "tls.handshake.extensions_server_name"]
+        disp = "tls.handshake.type==1"
+    else:
+        print(f"\nCapturing DNS queries for 15s on interface {iface} ...")
+        print("(browse something on this PC to see more)\n")
+        print(f"{'SOURCE':<16}DOMAIN")
+        print("-" * 50)
+        fields = ["-e", "ip.src", "-e", "dns.qry.name"]
+        disp = "dns.flags.response==0"
+
+    try:
+        subprocess.run([tshark, "-i", iface, "-a", "duration:15", "-n",
+                        "-Y", disp, "-T", "fields"] + fields)
+    except Exception as e:
+        print(f"Capture failed ({e}). Npcap may need an admin shell.")
+
+
+# ----------------------------------------------------------------------
+# STEP 4 - Remote access helpers
+# ----------------------------------------------------------------------
+def _listening_ports():
+    """Return ['139 file-share', '445 smb', ...] for curated ports this PC listens on."""
+    out = subprocess.run(["netstat", "-an"], capture_output=True, text=True).stdout
+    seen = set()
+    for line in out.splitlines():
+        if "LISTEN" not in line.upper():
+            continue
+        parts = line.split()
+        local = parts[1] if len(parts) > 1 else ""   # local address column
+        m = re.search(r"[:.](\d+)$", local)
+        if m and int(m.group(1)) in PORTS:           # only curated server ports (avoid noise)
+            seen.add(int(m.group(1)))
+    return [f"{p} {port_name(p)}" for p in sorted(seen)]
+
+
+def step_remote(net):
+    print("\n[Step 4] Remote access to your own devices")
+    print(f"""  SSH out:        ssh user@<ip>
+  Remote Desktop: mstsc /v:<ip>   (target must be Windows Pro+ with RDP on)
+  Router admin:   http://{net['gateway']}
+""")
+
+    print("This machine's remote-access tools:")
+    print(f"  SSH client: {'yes' if shutil.which('ssh') else 'no'}")
+    if IS_WIN:
+        try:
+            import winreg
+            k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                               r"System\CurrentControlSet\Control\Terminal Server")
+            deny = winreg.QueryValueEx(k, "fDenyTSConnections")[0]
+            print(f"  RDP host (incoming): {'enabled' if deny == 0 else 'disabled'}"
+                  "  (note: Windows Home cannot host RDP)")
+        except OSError:
+            pass
+
+    print("\nThis machine's listening services:")
+    listening = _listening_ports()
+    if listening:
+        for item in listening:
+            print(f"  port {item}")
+    else:
+        print("  (no common server ports listening - this PC is a pure client)")
+
+
+# ----------------------------------------------------------------------
+# STEP 5 - Watch for devices joining / leaving
+# ----------------------------------------------------------------------
+def _load_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _save_json(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except OSError:
+        pass
+
+
+# ----------------------------------------------------------------------
+# Menu
+# ----------------------------------------------------------------------
+MENU = """
+  1) Discover devices on the network
+  2) Port scan a device (nmap, or built-in fallback)
+  3) Read traffic (Wireshark)
+  4) Remote access helpers
+  q) Quit
+"""
+
+
+BAR = "=" * 64
+
+
+def section(title):
+    print(f"\n{title}")
+    print("-" * 64)
+
+
+def auto_report(net):
+    """Run every step on its own, print a clean report, and exit. No prompts."""
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(BAR)
+    print(f"  LAN NETWORK REPORT{' ' * 24}{time.strftime('%Y-%m-%d %H:%M')}")
+    print(f"  This PC: {net['ip']}     Router: {net['gateway']}")
+    print(BAR)
+
+    # --- [1] Discover devices ---
+    section("[1] DEVICES ON THE NETWORK")
+    print("  Scanning 254 addresses ...\n")
+    rows = discover_devices(net)
+    print_devices(rows, indent="  ")
+
+    # --- [2] Port scan every device (compact, one line each) ---
+    section("[2] OPEN PORTS  (common-port scan of each device)")
+    for ip, mac, name, priv, note in rows:
+        if mac == "(this pc)":
+            print(f"  {ip:<16}{'THIS PC':<12}(skipped)")
+            continue
+        ports = scan_common(ip)
+        label = note or ("device")
+        if ports:
+            desc = "  ".join(f"{p}({port_name(p)})" for p in ports)
+        else:
+            desc = "- none open (client device)"
+        print(f"  {ip:<16}{label:<12}{desc}")
+
+    # --- [3] DNS traffic (10s live capture) ---
+    section("[3] DNS TRAFFIC  (10s live capture - domains looked up now)")
+    tshark = find_tshark()
+    iface = wifi_interface(tshark) if tshark else None
+    if not tshark:
+        print("  tshark not found - skipping (install Wireshark to enable).")
+    elif not iface:
+        print("  No Wi-Fi capture interface found - skipping.")
+    else:
+        try:
+            cap = subprocess.run(
+                [tshark, "-i", iface, "-a", "duration:10", "-n",
+                 "-Y", "dns.flags.response==0", "-T", "fields",
+                 "-e", "ip.src", "-e", "dns.qry.name"],
+                capture_output=True, text=True).stdout
+            seen = []
+            for line in cap.splitlines():
+                parts = line.split("\t")
+                if len(parts) != 2 or not parts[0] or not parts[1]:
+                    continue
+                src = parts[0]
+                dom = parts[1].split(",")[0]          # first name if several
+                if dom.endswith(".local"):
+                    dom += "  (mDNS)"                  # local service discovery
+                if (src, dom) not in seen:
+                    seen.append((src, dom))
+            if seen:
+                for src, dom in seen:
+                    print(f"  {src:<16}-> {dom}")
+            else:
+                print("  (no DNS lookups during this 10s window - try while browsing)")
+        except Exception as e:
+            print(f"  capture skipped ({e})")
+
+    # --- [4] Remote access snapshot ---
+    section("[4] REMOTE ACCESS  (this PC)")
+    print(f"  SSH client : {'yes' if shutil.which('ssh') else 'no'}")
+    if IS_WIN:
+        try:
+            import winreg
+            k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                               r"System\CurrentControlSet\Control\Terminal Server")
+            deny = winreg.QueryValueEx(k, "fDenyTSConnections")[0]
+            note = "" if deny else "  "
+            print(f"  RDP host   : {'enabled' if deny == 0 else 'disabled'}"
+                  f"  (Windows Home cannot host RDP)")
+        except OSError:
+            pass
+    listening = _listening_ports()
+    print(f"  Listening  : {', '.join(listening) if listening else 'none (pure client)'}")
+    print(f"  Router UI  : http://{net['gateway']}")
+
+    # --- [5] Baseline check (new / unknown devices) ---
+    section("[5] BASELINE CHECK  (new devices since last run)")
+    base_path = os.path.join(HOME, "Downloads", "lan-known-devices.json")
+    known = _load_json(base_path) or {}
+    current = {mac: ip for ip, mac, *_ in rows if mac != "(this pc)"}
+    new = [m for m in current if m not in known]
+    if not known:
+        print("  First run - saved current devices as the baseline.")
+    elif new:
+        print(f"  *** {len(new)} NEW / UNKNOWN device(s): ***")
+        for m in new:
+            print(f"      {current[m]:<16}{m}")
+        print("  Investigate with:  python lan-toolkit.py --menu  (option 2)")
+    else:
+        print("  All devices match the baseline. Nothing new.")
+    for ip, mac, name, *_ in rows:
+        if mac != "(this pc)" and mac not in known:
+            known[mac] = {"name": name, "ip": ip, "first_seen": stamp}
+    _save_json(base_path, known)
+
+    print(f"\n{BAR}")
+    print(f"  Report complete.   (menu mode:  python lan-toolkit.py --menu)")
+    print(BAR)
+
+
+def run_menu(net):
+    print("================ LAN Toolkit (Python) ================")
+    print(f" This machine: {net['ip']}   Router: {net['gateway']}")
+    print("======================================================")
+    actions = {
+        "1": step_discover, "2": step_portscan, "3": step_traffic,
+        "4": step_remote,
+    }
+    while True:
+        print(MENU)
+        choice = input("Choose: ").strip().lower()
+        if choice == "q":
+            break
+        action = actions.get(choice)
+        if action:
+            try:
+                action(net)
+            except Exception as e:
+                print(f"Error: {e}")
+        else:
+            print("Pick 1-4 or q.")
+
+
+def main():
+    net = get_net()
+    args = [a.lower() for a in sys.argv[1:]]
+
+    # Default = automatic full report. Use --menu / -m for the interactive menu.
+    if "--menu" in args or "-m" in args:
+        run_menu(net)
+    else:
+        auto_report(net)
+
+
+if __name__ == "__main__":
+    main()
