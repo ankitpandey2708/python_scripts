@@ -1210,39 +1210,6 @@ def step_dnsspoof(net, target=None, domain=None, redirect=None):
 
 
 # ----------------------------------------------------------------------
-# STEP 7 - DECRYPT HTTPS via your own CA  (YOUR OWN device only)
-# ----------------------------------------------------------------------
-# Reading HTTPS *content* (not just SNI) needs a full TLS proxy whose CA
-# the device trusts - i.e. mitmproxy + its certificate installed on a phone
-# YOU control. This sets up / explains that workflow; it does not weaken
-# anyone else's security.
-def step_decrypt(net):
-    print("\n[Step 7] DECRYPT HTTPS via your own CA  (YOUR OWN device only)")
-    mitm = shutil.which("mitmweb") or shutil.which("mitmdump") or shutil.which("mitmproxy")
-    print("""
-To read HTTPS *contents* you must terminate TLS yourself with a proxy whose
-root certificate the target device trusts. This only works on a device you
-control (you have to install the certificate on it).
-
-Workflow:
-  1. Install mitmproxy:            pip install mitmproxy
-  2. Start it (a proxy on :8080):  mitmweb   (or mitmdump)
-  3. On YOUR phone's Wi-Fi settings, set the HTTP proxy to this PC:
-        proxy host = {ip} , port = 8080
-  4. On the phone, open  http://mitm.it  and install + TRUST the CA cert
-     (Android 14: Settings > Security > encrypt... > install from storage;
-      note user-CAs are not trusted by apps that pin certs).
-  5. Browse on the phone - mitmproxy shows full decrypted requests.
-""".format(ip=net["ip"]))
-    if mitm:
-        if input(f"Launch {os.path.basename(mitm)} now? [y/N]: ").strip().lower() == "y":
-            subprocess.Popen([mitm])
-            print("  Launched. Set the phone's proxy and install the CA as above.")
-    else:
-        print("  mitmproxy not installed yet - run:  pip install mitmproxy")
-
-
-# ----------------------------------------------------------------------
 # JSON baseline helpers (used by the auto report)
 # ----------------------------------------------------------------------
 def _load_json(path):
@@ -1271,7 +1238,6 @@ MENU = """
   4) Remote access helpers
   5) Intercept a device's traffic   (auto IPv4/IPv6, your own devices only)
   6) DNS spoof - redirect a domain  (your own devices only)
-  7) Decrypt HTTPS via your own CA  (your own device only)
   q) Quit
 """
 
@@ -1396,7 +1362,7 @@ def run_menu(net):
     actions = {
         "1": step_discover, "2": step_portscan, "3": step_traffic,
         "4": step_remote, "5": step_intercept,
-        "6": step_dnsspoof, "7": step_decrypt,
+        "6": step_dnsspoof,
     }
     while True:
         try:
@@ -1412,7 +1378,7 @@ def run_menu(net):
                     print(f"Error: {e}")
                 input("\n[Enter] to return to the menu ...")   # keep results on screen
             else:
-                print("Pick 1-7 or q.")
+                print("Pick 1-6 or q.")
         except KeyboardInterrupt:
             print("\nInterrupted - back to menu. (q to quit)")
 
