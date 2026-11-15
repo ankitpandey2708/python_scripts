@@ -353,17 +353,27 @@ payloads are encrypted - you see WHICH hosts, not the contents.
 # STEP 4 - Remote access helpers
 # ----------------------------------------------------------------------
 def _listening_ports():
-    """Return ['139 file-share', '445 smb', ...] for curated ports this PC listens on."""
-    out = subprocess.run(["netstat", "-an"], capture_output=True, text=True).stdout
+    """Return ['139 file-share', '445 smb', ...] for curated ports this PC
+    listens on. Uses netstat, falling back to `ss` where netstat is absent
+    (modern Linux drops net-tools)."""
+    out = ""
+    for cmd in (["netstat", "-an"], ["ss", "-ltn"]):
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True).stdout
+            if out.strip():
+                break
+        except FileNotFoundError:
+            continue
     seen = set()
     for line in out.splitlines():
         if "LISTEN" not in line.upper():
             continue
-        parts = line.split()
-        local = parts[1] if len(parts) > 1 else ""   # local address column
-        m = re.search(r"[:.](\d+)$", local)
-        if m and int(m.group(1)) in PORTS:           # only curated server ports (avoid noise)
-            seen.add(int(m.group(1)))
+        # peer columns on a LISTEN line are :0 or :* (never a curated port),
+        # so scanning the whole line and filtering by PORTS is safe for both
+        # netstat and ss output formats.
+        for m in re.findall(r"[:.](\d+)\b", line):
+            if int(m) in PORTS:
+                seen.add(int(m))
     return [f"{p} {port_name(p)}" for p in sorted(seen)]
 
 
@@ -495,7 +505,57 @@ def _ipv6_neighbors(net_prefix_unused=None):
 # Fallback: identify WHO owns a destination IP when the name is hidden
 # (ECH / Private Relay / VPN). Uses reverse-DNS + Team Cymru's free
 # IP-to-ASN DNS service (no API key). Names may be gone, but the IP isn't.
+# The TXT lookup is done with a tiny pure-stdlib UDP DNS query so it needs
+# no external binary (nslookup/dig) and works identically on every OS.
 # ----------------------------------------------------------------------
+def _dns_txt(name):
+    """Return the TXT record strings for `name` via a public resolver, or []."""
+    import struct, random
+    q = struct.pack(">HHHHHH", random.randint(0, 0xFFFF), 0x0100, 1, 0, 0, 0)
+    for label in name.split("."):
+        q += bytes([len(label)]) + label.encode()
+    q += b"\x00" + struct.pack(">HH", 16, 1)   # QTYPE=TXT, QCLASS=IN
+    for server in ("1.1.1.1", "8.8.8.8"):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(4)
+            s.sendto(q, (server, 53))
+            data, _ = s.recvfrom(4096)
+            s.close()
+        except Exception:
+            continue
+        try:
+            ancount = struct.unpack(">H", data[6:8])[0]
+            if not ancount:
+                return []
+            off = 12                                   # skip header
+            while data[off]:                           # skip the question name
+                off += data[off] + 1
+            off += 5                                    # null byte + QTYPE + QCLASS
+            out = []
+            for _ in range(ancount):
+                if data[off] & 0xC0 == 0xC0:           # compressed name pointer
+                    off += 2
+                else:
+                    while data[off]:
+                        off += data[off] + 1
+                    off += 1
+                rtype, _cls, _ttl, rdlen = struct.unpack(">HHIH", data[off:off + 10])
+                off += 10
+                rdata = data[off:off + rdlen]
+                off += rdlen
+                if rtype == 16:                        # TXT
+                    i, txt = 0, ""
+                    while i < len(rdata):
+                        ln = rdata[i]; i += 1
+                        txt += rdata[i:i + ln].decode("utf-8", "replace"); i += ln
+                    out.append(txt)
+            return out
+        except Exception:
+            return []
+    return []
+
+
 def _ip_lookup(ip):
     """Return (reverse_dns, 'ASnnnn Org') for an IP; either part may be ''."""
     rdns = ""
@@ -507,16 +567,13 @@ def _ip_lookup(ip):
     try:
         if "." in ip:   # IPv4 only for the Cymru origin lookup (keeps it simple)
             rev = ".".join(reversed(ip.split("."))) + ".origin.asn.cymru.com"
-            txt = subprocess.run(["nslookup", "-type=TXT", rev],
-                                 capture_output=True, text=True, timeout=5).stdout
-            m = re.search(r'"\s*(\d+)\s*\|', txt)       # 1st field = ASN
-            if m:
-                asn = m.group(1)
-                txt2 = subprocess.run(["nslookup", "-type=TXT", f"AS{asn}.asn.cymru.com"],
-                                      capture_output=True, text=True, timeout=5).stdout
-                mo = re.search(r'"([^"]*\|[^"]*)"', txt2)
-                org = mo.group(1).split("|")[-1].strip() if mo else ""
-                asn_org = f"AS{asn} {org}".strip()
+            txts = _dns_txt(rev)
+            if txts:
+                asn = txts[0].split("|")[0].strip()    # 1st field = ASN
+                if asn.isdigit():
+                    org_txts = _dns_txt(f"AS{asn}.asn.cymru.com")
+                    org = org_txts[0].split("|")[-1].strip() if org_txts else ""
+                    asn_org = f"AS{asn} {org}".strip()
     except Exception:
         pass
     return rdns, asn_org
