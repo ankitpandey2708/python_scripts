@@ -394,13 +394,17 @@ def _set_forwarding(alias, state):
                        capture_output=True, text=True)
 
 
-def step_arp(net):
+def step_arp(net, target=None):
     print("\n[Step 5] ARP MAN-IN-THE-MIDDLE LAB  (YOUR OWN devices only)")
     print("""Spoofs ONE device so its traffic flows through this PC, then shows
 which servers it connects to (TLS SNI). Use ONLY on your own network
 and your own devices. Everything is restored when it stops.""")
 
-    target = input("\nTarget device IP (e.g. your phone): ").strip()
+    if target is None:
+        target = input("\nTarget device IP (e.g. your phone): ").strip()
+    else:
+        target = target.strip()
+        print(f"\nTarget: {target}")
     if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", target):
         print("  Not a valid IP."); return
     if not target.startswith(net["prefix"]):
@@ -480,17 +484,31 @@ and your own devices. Everything is restored when it stops.""")
                 print(f"  {sni:<40}{dst}")
         else:
             print("  (no HTTPS server names seen - is the device active?)")
+        # save results so an elevated run can be read back
+        try:
+            out_path = os.path.join(HOME, "Downloads", "arp-sni.txt")
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(f"ARP intercept of {target}  {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                for sni, dst in seen:
+                    f.write(f"{sni}\t{dst}\n")
+                if not seen:
+                    f.write("(no HTTPS server names captured)\n")
+        except OSError:
+            pass
     finally:
         print("\nStopping spoof and RESTORING the network ...")
         stop.set()
         th.join(timeout=3)
-        # send the CORRECT mappings back to both sides, several times
+        # Send the CORRECT mappings back to both sides, many times with small
+        # gaps, so a device that cached the poisoned entry is sure to re-learn
+        # the real MAC BEFORE we remove forwarding (otherwise it black-holes).
         fix_t = Ether(dst=t_mac) / ARP(op=2, pdst=target, hwdst=t_mac, psrc=gw, hwsrc=g_mac)
         fix_g = Ether(dst=g_mac) / ARP(op=2, pdst=gw, hwdst=g_mac, psrc=target, hwsrc=t_mac)
-        for _ in range(5):
+        for _ in range(15):
             sendp(fix_t, verbose=0)
             sendp(fix_g, verbose=0)
-        _set_forwarding(alias, "Disabled")
+            time.sleep(0.2)
+        _set_forwarding(alias, "Disabled")   # remove forwarding only after re-learning
         print("  ARP tables restored, IP forwarding disabled. Done.")
 
 
@@ -662,9 +680,38 @@ def run_menu(net):
             print("Pick 1-5 or q.")
 
 
+def _pick_target(net):
+    """Show discovered devices and let the user choose one to intercept."""
+    print("\nDiscovering devices to choose a target ...")
+    rows = discover_devices(net)
+    cands = [(ip, mac, name) for ip, mac, name, priv, note in rows
+             if mac != "(this pc)" and ip != net["gateway"]]
+    if not cands:
+        print("  No candidate devices found."); return None
+    print("\nSelect a device to intercept (YOUR OWN devices only):")
+    for idx, (ip, mac, name) in enumerate(cands, 1):
+        print(f"  {idx}) {ip:<15} {mac:<18} {name}")
+    choice = input("Number (blank to cancel): ").strip()
+    if not choice.isdigit() or not (1 <= int(choice) <= len(cands)):
+        print("  Cancelled."); return None
+    return cands[int(choice) - 1][0]
+
+
 def main():
     net = get_net()
     args = [a.lower() for a in sys.argv[1:]]
+
+    # --arp [ip] : run the ARP intercept. With an IP it runs non-interactively;
+    # without one, it lists devices and lets you pick. (Needs an admin shell.)
+    if "--arp" in args:
+        i = args.index("--arp")
+        nxt = args[i + 1] if i + 1 < len(args) else None
+        target = nxt if (nxt and re.match(r"^\d{1,3}(\.\d{1,3}){3}$", nxt)) else None
+        if target is None:
+            target = _pick_target(net)
+        if target:
+            step_arp(net, target)
+        return
 
     # Default = automatic full report. Use --menu / -m for the interactive menu.
     if "--menu" in args or "-m" in args:
