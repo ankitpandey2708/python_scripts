@@ -534,7 +534,7 @@ def _report_capture(seen, target, fname):
 
 
 def step_arp(net, target=None):
-    print("\n[Step 5] ARP MAN-IN-THE-MIDDLE LAB  (YOUR OWN devices only)")
+    print("\n[Intercept: ARP / IPv4]  (YOUR OWN devices only)")
     print("""Spoofs ONE device so its traffic flows through this PC, then shows
 which servers it connects to (TLS SNI). Use ONLY on your own network
 and your own devices. Everything is restored when it stops.""")
@@ -646,7 +646,7 @@ and your own devices. Everything is restored when it stops.""")
 # nothing to IPv4 - a dual-stack device needs BOTH to be fully intercepted.
 
 def step_ndp(net, target=None):
-    print("\n[Step 6] NDP / RA SPOOFING - IPv6 MITM  (YOUR OWN devices only)")
+    print("\n[Intercept: NDP / IPv6]  (YOUR OWN devices only)")
     print("""IPv6 version of the ARP lab: poisons a device's NEIGHBOR cache (and
 optionally sends a rogue Router Advertisement) so its IPv6 traffic flows
 through this PC. Only on your own network/devices. Restored on exit.""")
@@ -760,6 +760,36 @@ through this PC. Only on your own network/devices. Restored on exit.""")
 
 
 # ----------------------------------------------------------------------
+# STEP 5 - INTERCEPT (unified): pick a device, auto-route to ARP (IPv4)
+# or NDP (IPv6) by the target's address family. One menu entry for both.
+# ----------------------------------------------------------------------
+def step_intercept(net, target=None):
+    if target is None:
+        print("\nDiscovering devices to choose a target ...")
+        cands = []
+        for ip, mac, name, priv, note in discover_devices(net):
+            if mac != "(this pc)" and ip != net["gateway"]:
+                cands.append((ip, mac, name, "IPv4"))
+        for ip6, mac in _ipv6_neighbors():
+            cands.append((ip6, mac, "(IPv6 neighbor)", "IPv6"))
+        if not cands:
+            print("  No candidate devices found."); return
+        print("\nSelect a device to intercept (YOUR OWN devices only):")
+        for idx, (ip, mac, name, fam) in enumerate(cands, 1):
+            print(f"  {idx}) [{fam}] {ip:<34} {mac:<18} {name}")
+        choice = input("Number (blank to cancel): ").strip()
+        if not choice.isdigit() or not (1 <= int(choice) <= len(cands)):
+            print("  Cancelled."); return
+        target = cands[int(choice) - 1][0]
+
+    # Dispatch by address family: ':' => IPv6 (NDP), else IPv4 (ARP)
+    if ":" in target:
+        step_ndp(net, target)
+    else:
+        step_arp(net, target)
+
+
+# ----------------------------------------------------------------------
 # JSON baseline helpers (used by the auto report)
 # ----------------------------------------------------------------------
 def _load_json(path):
@@ -786,8 +816,7 @@ MENU = """
   2) Port scan a device (nmap, or built-in fallback)
   3) Read traffic (Wireshark)
   4) Remote access helpers
-  5) ARP intercept lab   (IPv4, your own devices only)
-  6) NDP/RA intercept    (IPv6, your own devices only)
+  5) Intercept a device's traffic   (auto IPv4/IPv6, your own devices only)
   q) Quit
 """
 
@@ -911,7 +940,7 @@ def run_menu(net):
     print("======================================================")
     actions = {
         "1": step_discover, "2": step_portscan, "3": step_traffic,
-        "4": step_remote, "5": step_arp, "6": step_ndp,
+        "4": step_remote, "5": step_intercept,
     }
     while True:
         print(MENU)
@@ -925,7 +954,7 @@ def run_menu(net):
             except Exception as e:
                 print(f"Error: {e}")
         else:
-            print("Pick 1-6 or q.")
+            print("Pick 1-5 or q.")
 
 
 def _pick_target(net):
