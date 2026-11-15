@@ -435,7 +435,8 @@ def _ipv6_neighbors(net_prefix_unused=None):
 # (ECH / Private Relay / VPN). Uses reverse-DNS + Team Cymru's free
 # IP-to-ASN DNS service (no API key). Names may be gone, but the IP isn't.
 # ----------------------------------------------------------------------
-def ip_org(ip):
+def _ip_lookup(ip):
+    """Return (reverse_dns, 'ASnnnn Org') for an IP; either part may be ''."""
     rdns = ""
     try:
         rdns = socket.gethostbyaddr(ip)[0]
@@ -457,6 +458,11 @@ def ip_org(ip):
                 asn_org = f"AS{asn} {org}".strip()
     except Exception:
         pass
+    return rdns, asn_org
+
+
+def ip_org(ip):
+    rdns, asn_org = _ip_lookup(ip)
     parts = [p for p in (rdns, asn_org) if p]
     return "  |  ".join(parts) if parts else "?"
 
@@ -482,25 +488,47 @@ def _flows_to_seen(cap, target):
 
 
 def _report_capture(seen, target, fname):
-    """seen: list of (sni, dst). Print each; when SNI is empty (ECH/relay),
-    fall back to ip_org(dst). Also save to Downloads/<fname>."""
-    enriched = [(sni, dst, "" if sni else ip_org(dst)) for sni, dst in seen]
-    if enriched:
-        for sni, dst, org in enriched:
-            if sni:
-                print(f"  {sni:<40}{dst}")
-            else:
-                print(f"  {'(no SNI - ECH/relay?)':<40}{dst}")
-                print(f"  {'':<40}  -> {org}")
+    """Organise captured flows into two clear groups:
+      1. NAMED  - connections whose SNI was visible (plaintext hostname)
+      2. HIDDEN - no SNI (ECH/relay/established); identified by IP owner,
+                  grouped by organisation so one owner = one block.
+    Prints a readable report and saves the same structure to Downloads/<fname>."""
+    named = sorted({(sni, dst) for sni, dst in seen if sni})
+    hidden_ips = sorted({dst for sni, dst in seen if not sni})
+
+    groups = {}   # "ASnnnn Org" -> [(ip, rdns), ...]
+    for ip in hidden_ips:
+        rdns, org = _ip_lookup(ip)
+        groups.setdefault(org or "(unknown owner)", []).append((ip, rdns))
+
+    lines = []
+    lines.append(f"Intercept of {target}   {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"{len(named)} named  +  {len(hidden_ips)} hidden "
+                 f"across {len(groups)} owners")
+    lines.append("")
+    lines.append("NAMED  (plaintext SNI - exact hostname visible)")
+    lines.append("-" * 60)
+    if named:
+        for sni, dst in named:
+            lines.append(f"  {sni:<42}{dst}")
     else:
-        print("  (no HTTPS connections seen - is the device active?)")
+        lines.append("  (none)")
+    lines.append("")
+    lines.append("HIDDEN  (no SNI - identified by IP owner)")
+    lines.append("-" * 60)
+    if groups:
+        for org in sorted(groups):
+            ips = groups[org]
+            lines.append(f"  {org}")
+            for ip, rdns in ips:
+                lines.append(f"      {ip:<16}{rdns}")
+    else:
+        lines.append("  (none)")
+
+    print("\n".join("  " + ln for ln in lines))
     try:
         with open(os.path.join(HOME, "Downloads", fname), "w", encoding="utf-8") as f:
-            f.write(f"intercept of {target}  {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            for sni, dst, org in enriched:
-                f.write(f"{sni or '(no SNI)'}\t{dst}\t{org}\n")
-            if not enriched:
-                f.write("(no connections captured)\n")
+            f.write("\n".join(lines) + "\n")
     except OSError:
         pass
 
@@ -577,8 +605,6 @@ and your own devices. Everything is restored when it stops.""")
         if not (tshark and iface):
             print("  tshark/Wi-Fi interface not found - cannot show SNI.")
             return
-        print(f"  {'SERVER (SNI)':<40}DEST IP")
-        print("  " + "-" * 56)
         # Capture ALL 443 traffic from the target (not just handshakes), so
         # ALREADY-OPEN connections show up too - their data packets still
         # reveal the destination IP, which we resolve via ip_org().
@@ -705,8 +731,6 @@ through this PC. Only on your own network/devices. Restored on exit.""")
     try:
         if not (tshark and iface):
             print("  tshark/Wi-Fi interface not found - cannot show SNI."); return
-        print(f"  {'SERVER (SNI)':<40}DEST IPv6")
-        print("  " + "-" * 56)
         cap = subprocess.run(
             [tshark, "-i", iface, "-a", "duration:20", "-n",
              "-Y", f"ipv6.src=={target} && (tcp.port==443 || udp.port==443)",
